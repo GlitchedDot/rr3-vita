@@ -1,0 +1,15 @@
+# Never commit the game ROM, in any copy or name
+*.bin
+rr3.bin
+
+# Never commit crash dumps or built packages
+*.psp2dmp
+*.vpk
+*.elf
+*.self
+
+# Build output (regenerable from source)
+build/
+build-*/
+*.o
+*.a
