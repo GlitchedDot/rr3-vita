@@ -609,9 +609,9 @@ static void interp_drive_mainloop(uint32_t entry_pc) {
         }
         M68kiStatus st = m68k_interp_step();
         if (st != M68KI_OK) {
-            fprintf(stderr, "[FORCE_INTERP] HALT st=%d at PC=$%06X op=$%04X — parking "
-                    "(unimplemented instruction: complete the interpreter)\n",
-                    (int)st, g_m68ki_bad_pc, g_m68ki_bad_op);
+            /* Park silently: no stdio on the game fiber (see the note in
+             * game_fiber_func). g_m68ki_bad_pc/g_m68ki_bad_op keep the
+             * evidence for any host-side reader after the park. */
             for (;;) yield_to_main(GLUE_YIELD_HALT);
         }
         /* NOTE: no per-instruction check_cycle_budget() here. The native recomp
@@ -655,7 +655,10 @@ static void game_fiber_func(void *param)
 
     if (genesis_force_interp()) {
         uint32_t entry = m68k_read32(4) & 0xFFFFFFu;   /* 68K reset vector */
-        fprintf(stderr, "[FORCE_INTERP] driving from reset PC $%06X\n", entry);
+        /* NO stdio/file IO on the game fiber, ever: on Vita, stdio from
+         * inside the minicoro fiber kills the process (root-caused
+         * 2026-10-18, RR3 builds P-AJ). The PC tolerates it; the Vita
+         * does not. Keep this fiber pure compute + bus + yields. */
         interp_drive_mainloop(entry);   /* never returns */
     }
 

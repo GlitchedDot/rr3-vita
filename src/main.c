@@ -267,15 +267,26 @@ static int sim_thread(SceSize args, void *argp)
     /* ---- phase 1: headless sim cost ---- */
     GenesisSimHooks no_sink = s_hooks; no_sink.sink = NULL;
     uint64_t t0 = sceKernelGetProcessTimeWide();
+#ifdef RR3_FINEGRAIN
+    breadcrumb("p1-enter", 0.0);
+#endif
     for (int i = 0; i < 600; i++) {
         genesis_sim_step(&in, &s_audio, &no_sink);
-#ifdef RR3_FORCE_INTERP_ENV
+#ifdef RR3_FINEGRAIN
+        breadcrumb("p1", 0.0);
+#elif defined(RR3_FORCE_INTERP_ENV)
         if (((i + 1) % 60) == 0) breadcrumb("p1", 0.0);
 #endif
     }
     uint64_t t1 = sceKernelGetProcessTimeWide();
     double sim_ms = (double)(t1 - t0) / 1000.0 / 600.0;
     breadcrumb("phase1-done", sim_ms);
+#ifdef RR3_MASK_LO
+    { extern uint32_t g_mask_tried, g_mask_hit;
+      FILE *mf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+      if (mf) { fprintf(mf, "maskstat phase=1 tried=%u hit=%u\n",
+                        g_mask_tried, g_mask_hit); fclose(mf); } }
+#endif
 
     /* ---- phase 2: sink-live cost, unthrottled ---- */
     t0 = sceKernelGetProcessTimeWide();
@@ -327,6 +338,14 @@ static int sim_thread(SceSize args, void *argp)
         last = now;
         frames++;
         if ((frames % 60) == 0) breadcrumb("play", roll_ms);
+#ifdef RR3_MASK_LO
+        if ((frames % 1200) == 0) {
+            extern uint32_t g_mask_tried, g_mask_hit;
+            FILE *mf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+            if (mf) { fprintf(mf, "maskstat phase=3 frames=%d tried=%u hit=%u\n",
+                              frames, g_mask_tried, g_mask_hit); fclose(mf); }
+        }
+#endif
 
         sceDisplayWaitVblankStart();
     }

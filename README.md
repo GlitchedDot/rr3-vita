@@ -19,15 +19,63 @@ repository, in any form. Developed against the USA/Europe ROM
 
 - **PC build (in `engine/`): complete** — full speed with sound, races and
   two-player split-screen, verified over long play sessions.
-- **Vita build: in active development.** The game boots and races on real
-  hardware, but a crash (C2-12828-1) still ends runs during racing. The
-  hunt is documented in `docs/`; the simulation itself is proven
-  bit-faithful to the PC build frame-for-frame, and the Z80, the audio
-  renderer, H-interrupt delivery, the display path, and the V-interrupt
-  handler body have been bisected and cleared. The fault is isolated to
-  the shared scheduling/fiber layer and is still being chased. Sound
-  output on Vita is a later milestone. Expect a well-instrumented work in
-  progress, not a finished game.
+- **Vita build: in active development, and the crash hunt has had a big
+  week (updated 2026-10-19).** There turned out to be **two separate
+  deaths**, not one:
+
+  - **The interpreter death — SOLVED.** The engine's reference interpreter
+    (used as a diagnostic backend) died inside the very first emulated
+    tick on Vita, while the PC build ran it cleanly. Root cause: the
+    game's code runs on a cooperative fiber (minicoro), and the engine's
+    interpreter entry path executed an `fprintf` on that fiber. File
+    IO/stdio from inside the fiber kills the process on this platform —
+    the fiber tolerates at most one such write. (Several diagnostic
+    builds then "re-poisoned" themselves by logging from the fiber; the
+    ladder experiments that isolated this are written up in `docs/`.)
+    **Fix, now in `engine/runner/glue.c`: the game fiber does zero
+    stdio/file IO — the two fiber-side `fprintf`s are deleted.** With
+    that, the interpreter runs indefinitely on the Vita and is
+    **bit-exact against the PC interpreter** (identical instruction and
+    yield counts over 600 frames; it ran past tick 10,020 on hardware),
+    so there is now a trustworthy reference *on the device itself*.
+  - **The native death — cornered, not yet fixed.** The recompiled build
+    still crashes (C2-12828-1) in the attract-mode demo race, around tick
+    5,353, with the simulation bit-identical to the PC reference at every
+    checkpoint up to the edge. Using a dispatch mask that substitutes the
+    interpreter for chosen guest functions (`src/rr3_dispatch_mask.c`,
+    the `RR3_MASK_*` options in `CMakeLists.txt`), the fault has been
+    bisected function-by-function:
+    - **"Killer B" is named: guest function `func_024A4C`** — substituting
+      it (which routes its subtree through the interpreter) eliminates a
+      second, later death at demo tick ~5,579.
+    - **"Killer A" (the 5,353 death) is narrowed to 10 candidate
+      functions** at the top of the dispatch table (guest addresses
+      `0x3B54A` and up); the bisect continues from there.
+    - A **third, rarer death** appeared at demo tick ~18,797 on a long
+      run, in a late attract segment; it is not localized yet and needs a
+      long soak test (20k+ ticks) once A and B are both substituted in
+      one build.
+    - The earlier subsystem bisections stand: the Z80, audio renderer,
+      DMA, H/V-interrupt delivery, display path, threading topology,
+      stacks, and both compiler-optimization axes were all cleared
+      before the fault was isolated to individual recompiled functions.
+
+  Sound output on Vita remains a later milestone. Expect a
+  well-instrumented work in progress, not a finished game.
+
+## What's next
+
+1. Finish bisecting Killer A (10 candidate functions left).
+2. Read the convicted functions' generated code against the interpreter
+   to identify the actual codegen defect(s); the prime suspects are the
+   recomp's split-stack / skip-return bookkeeping paths.
+3. Convert the mask workaround into a permanent, targeted fix (the
+   convicted functions are small and called rarely; running them
+   interpreted permanently costs nothing measurable).
+4. Long soak test (20k+ attract ticks) to localize the third death.
+5. Then the shipping list: performance pass, audio output, splitting
+   the work across Vita cores 0/1/3 (sim / presenter / audio), and the
+   final presentation (pixel-perfect view with an ambient-glow fill).
 
 ## Building
 
@@ -44,7 +92,8 @@ produces `build/rr3vita.vpk`.
 ## Layout
 
 - `src/` — the Vita front-end and every bisect glue variant used in the
-  crash hunt so far.
+  crash hunt so far (staged drivers, the no-DMA variant, the dispatch
+  mask).
 - `generated/` — the recompiled game code.
 - `engine/` — the Genesis machine layer the port compiles against
   (vendored from the trio repo; its `LICENSE.md` / `LICENSE-recompiler`
