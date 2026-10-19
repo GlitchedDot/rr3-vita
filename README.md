@@ -48,9 +48,12 @@ repository, in any form. Developed against the USA/Europe ROM
     - **"Killer B" is named: guest function `func_024A4C`** — substituting
       it (which routes its subtree through the interpreter) eliminates a
       second, later death at demo tick ~5,579.
-    - **"Killer A" (the 5,353 death) is narrowed to 10 candidate
-      functions** at the top of the dispatch table (guest addresses
-      `0x3B54A` and up); the bisect continues from there.
+    - **"Killer A" (the 5,353 death) is confined to 40 candidate
+      functions** (guest addresses `0x27D3E`–`0x3A4CE`); the bisect
+      continues there. (An earlier revision of this README said 10
+      candidates at `0x3B54A` and up — that was a flipped inference,
+      caught and corrected the same day; see the correction note in
+      `docs/rr3-crash-hunt-2026-10-19.md`.)
     - A **third, rarer death** appeared at demo tick ~18,797 on a long
       run, in a late attract segment; it is not localized yet and needs a
       long soak test (20k+ ticks) once A and B are both substituted in
@@ -65,7 +68,7 @@ repository, in any form. Developed against the USA/Europe ROM
 
 ## What's next
 
-1. Finish bisecting Killer A (10 candidate functions left).
+1. Finish bisecting Killer A (40 candidate functions left).
 2. Read the convicted functions' generated code against the interpreter
    to identify the actual codegen defect(s); the prime suspects are the
    recomp's split-stack / skip-return bookkeeping paths.

@@ -87,11 +87,31 @@ Two distinct killers fell out of the pattern:
   bypassing dispatch — then indexes a table with the result. Masking
   0x24A4C routes the whole subtree through the interpreter, which is
   why it convicts the subtree rather than one instruction.
-- **Killer A (the 5,353 death): one of 10 functions** at guest
-  addresses 0x3B54A–0x1FA064 (dispatch-table indices 627–636). AW
+- **Killer A (the 5,353 death): one of 40 functions** at guest
+  addresses 0x27D3E–0x3A4CE (dispatch-table indices 557–596). AW
   acquitted `func_027B84` of being A (substituting it alone changed
-  nothing); AX–AZ then halved the top 80 to these ten. The bisect
-  resumes there.
+  nothing). The bisect resumes there.
+
+> **Correction (2026-10-19, later the same day).** The first version
+> of this note said Killer A had been narrowed to 10 functions at
+> 0x3B54A and up. That was wrong. Build AX substituted the *lower* 40
+> of the top 80 (0x27D3E–0x3A4CE) and sailed, which places A *inside*
+> that substituted set — but the inference was recorded backwards in
+> the session log, and builds AY–BC then bisected the wrong half
+> (indices 597–636), dying at 5,353 on schedule. BC's elimination
+> result appeared to name `func_1FA064`; build BD, substituting
+> {`func_024A4C`, `func_1FA064`}, died at 5,353 anyway, acquitting
+> 1FA064 and exposing the flip. Replaying every verdict mechanically
+> (a substituted set that sails contains A; one that dies does not)
+> confines A to indices 557–596, consistent with every build from AL
+> onward. (For the record: `func_1FA064` is the game's ROM-checksum
+> self-test — sums the ROM, paints a red screen and halts on failure —
+> an interesting function, just not this killer.) Killer B's
+> conviction is unaffected: its chain ran with the top 80 substituted
+> throughout, so A was suppressed in every one of those builds. A
+> standing rule was added because of this: every future bisect build's
+> premise gets replayed against the full verdict history before the
+> build is made.
 - **Killer C (unlocalized):** a long run of AX crashed at tick 18,797,
   in a late attract segment (breadcrumbs show the demo had stopped
   dispatching into any substituted function thousands of ticks
