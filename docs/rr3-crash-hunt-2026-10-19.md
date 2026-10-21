@@ -131,3 +131,61 @@ Side observations worth keeping:
 - Core-dump memory forensics remain void on this firmware (the app's
   segments are recorded erased), and exception-PC records in dumps
   were previously proven unreliable; neither was used here.
+
+## Update — 2026-10-21
+
+### Done
+
+- **Killer A named: `func_02823A`** (guest 0x2823A). Build BH
+  (substituting two of the remaining candidates) died at 5,353; BI
+  (four) sailed; BJ (only 02823A substituted) sailed. A is a 719-line,
+  direct-call-heavy body in the generated code; note that calls made
+  directly between generated functions bypass the dispatch mask
+  entirely, which matters when the workaround becomes a fix.
+- **The "D deaths" were the tool, not the game.** Builds BL–BP died at
+  ticks 7,279 / 7,456 / 7,956 / 14,481 depending on how much of the
+  table was substituted, while a full-table substitution (BK) ran
+  clean past 37,000. Breadcrumb forensics (the on-device state log,
+  with its substitution counters) showed the process is deterministic
+  per configuration — BL and BM produced byte-identical counter
+  series and died on the same tick — and that the lethal dose is on
+  the order of several thousand capsule runs in mixed mode. Reading
+  the capsule code afterwards: its stack seam is sound by design
+  (peek the return, single pop, full CPU checkpoint/rollback). The
+  live suspects are cycle-accounting divergence between the two
+  backends, and guest-RAM writes from failed capsule runs never being
+  rolled back. Either way it is a bisect artifact, not a game bug.
+- **The tick gate.** `RR3_MASK3_GATE_TICK` (see `CMakeLists.txt` and
+  `src/rr3_dispatch_mask.c`) keeps a substitution range native until
+  a chosen tick, engaging it just before the death under study.
+  Exposure drops by more than 95%, and late-death bisections are
+  trustworthy again (build BQ onwards).
+- **Killer E discovered.** Once C could be suppressed past 18,797, a
+  further native death appeared at tick 19,985 (build BQ) — visible
+  only because every earlier build died at C first.
+
+### In progress
+
+- **Naming Killer C.** With the gate, the chain ran clean: BQ
+  (dispatch idx 273–409 substituted) passed 18,797; BR (273–341)
+  died on the tick; BS (342–375) died at 18,811, briefly suggesting
+  a sixth killer, until BT (376–409) passed both 18,797 and 18,811
+  and settled it — the 18,811 death was C's own detonation delayed
+  14 ticks by substitution drift. BU (376–392) then sailed past
+  18,797, so **C is one of 17 functions, guest 0x20608–0x21748**.
+  Halving continues.
+- E's tick also shifts with configuration (19,985 in BQ; 20,027 in
+  BT and BU) — the same delay phenomenon. E is native outside the
+  substituted region in every build so far, and waits until C is
+  named.
+
+### Upcoming
+
+- Name C; bisect E; read the convicted functions' generated code
+  against the interpreter to find the actual defect (the recomp's
+  split-stack bookkeeping is the standing suspect).
+- Convert the substitutions into a permanent fix, then a long soak
+  well past 20k attract ticks.
+- The shipping list: performance pass, audio output, the cores
+  0/1/3 split (sim / presenter / audio), the ambient-glow
+  presentation, and a Select-button pause menu with save states.

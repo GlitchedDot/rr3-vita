@@ -20,7 +20,7 @@ repository, in any form. Developed against the USA/Europe ROM
 - **PC build (in `engine/`): complete** — full speed with sound, races and
   two-player split-screen, verified over long play sessions.
 - **Vita build: in active development, and the crash hunt has had a big
-  week (updated 2026-10-19).** There turned out to be **two separate
+  week (updated 2026-10-21).** There turned out to be **two separate
   deaths**, not one:
 
   - **The interpreter death — SOLVED.** The engine's reference interpreter
@@ -48,16 +48,28 @@ repository, in any form. Developed against the USA/Europe ROM
     - **"Killer B" is named: guest function `func_024A4C`** — substituting
       it (which routes its subtree through the interpreter) eliminates a
       second, later death at demo tick ~5,579.
-    - **"Killer A" (the 5,353 death) is confined to 40 candidate
-      functions** (guest addresses `0x27D3E`–`0x3A4CE`); the bisect
-      continues there. (An earlier revision of this README said 10
-      candidates at `0x3B54A` and up — that was a flipped inference,
-      caught and corrected the same day; see the correction note in
-      `docs/rr3-crash-hunt-2026-10-19.md`.)
-    - A **third, rarer death** appeared at demo tick ~18,797 on a long
-      run, in a late attract segment; it is not localized yet and needs a
-      long soak test (20k+ ticks) once A and B are both substituted in
-      one build.
+    - **"Killer A" is named: guest function `func_02823A`** — the last
+      of the 40 candidates, convicted 2026-10-20. (An earlier revision
+      of this README put A in a different set of candidates entirely —
+      a flipped inference, caught and corrected the same day; see the
+      correction note in `docs/rr3-crash-hunt-2026-10-19.md`.)
+    - **The bisect tool then indicted itself.** Long runs that mix
+      native and substituted functions die at ticks that move with the
+      size of the substitution (7,279 / 7,456 / 7,956 / 14,481 across
+      builds) — a cumulative "capsule drift" in the substitution path,
+      deterministic per configuration and absent in both pure modes.
+      It is a tooling artifact, not a game bug; the forensics are in
+      the 2026-10-21 update in `docs/`. The fix is a **tick gate**
+      (`RR3_MASK3_GATE_TICK`): a substitution range engages only just
+      before the death under study, cutting exposure by >95% and
+      making late-death bisections trustworthy again.
+    - **"Killer C" (the third death, tick 18,797) is confined to 17
+      candidate functions** (guest `0x20608`–`0x21748`); naming it is
+      the current work.
+    - **A fourth death, "Killer E", was found behind C** at demo tick
+      ~19,985–20,027 (the exact tick shifts slightly with the build's
+      substitution configuration), native in every configuration seen
+      so far. It is queued behind C.
     - The earlier subsystem bisections stand: the Z80, audio renderer,
       DMA, H/V-interrupt delivery, display path, threading topology,
       stacks, and both compiler-optimization axes were all cleared
@@ -68,17 +80,21 @@ repository, in any form. Developed against the USA/Europe ROM
 
 ## What's next
 
-1. Finish bisecting Killer A (40 candidate functions left).
+1. Finish naming Killer C (17 candidate functions left), then bisect
+   Killer E the same way.
 2. Read the convicted functions' generated code against the interpreter
    to identify the actual codegen defect(s); the prime suspects are the
    recomp's split-stack / skip-return bookkeeping paths.
 3. Convert the mask workaround into a permanent, targeted fix (the
    convicted functions are small and called rarely; running them
    interpreted permanently costs nothing measurable).
-4. Long soak test (20k+ attract ticks) to localize the third death.
+4. Long soak test (well past 20k attract ticks) to prove no further
+   deaths are hiding behind E.
 5. Then the shipping list: performance pass, audio output, splitting
-   the work across Vita cores 0/1/3 (sim / presenter / audio), and the
-   final presentation (pixel-perfect view with an ambient-glow fill).
+   the work across Vita cores 0/1/3 (sim / presenter / audio), the
+   final presentation (pixel-perfect view with an ambient-glow fill),
+   and a Select-button pause menu with save states (the Genesis pad
+   has no Select, so the Vita's is free to claim).
 
 ## Building
 

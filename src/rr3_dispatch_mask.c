@@ -13,6 +13,7 @@
  * and no file IO anywhere in this path (it runs on the game fiber). */
 #include "m68k_interp.h"
 #include "genesis_host_mem.h"
+#include "sim_step.h"
 
 uint32_t g_mask_tried = 0, g_mask_hit = 0;
 static int rr3_mask_run(uint32_t addr) {
@@ -1392,6 +1393,16 @@ static void recomp_dispatch_once(uint32_t addr) {
         || (addr >= (uint32_t)RR3_MASK2_LO
 #ifdef RR3_MASK2_HI
             && addr < (uint32_t)RR3_MASK2_HI
+#endif
+            )
+#endif
+#ifdef RR3_MASK3_LO
+        || (addr >= (uint32_t)RR3_MASK3_LO
+#ifdef RR3_MASK3_HI
+            && addr < (uint32_t)RR3_MASK3_HI
+#endif
+#ifdef RR3_MASK3_GATE_TICK
+            && genesis_sim_tick_count() >= (uint32_t)RR3_MASK3_GATE_TICK
 #endif
             )
 #endif
