@@ -1406,6 +1406,26 @@ static void recomp_dispatch_once(uint32_t addr) {
 #endif
             )
 #endif
+#ifdef RR3_MASK4_LO
+        || (addr >= (uint32_t)RR3_MASK4_LO
+#ifdef RR3_MASK4_HI
+            && addr < (uint32_t)RR3_MASK4_HI
+#endif
+#ifdef RR3_MASK4_GATE_TICK
+            && genesis_sim_tick_count() >= (uint32_t)RR3_MASK4_GATE_TICK
+#endif
+            )
+#endif
+#ifdef RR3_MASK5_LO
+        || (addr >= (uint32_t)RR3_MASK5_LO
+#ifdef RR3_MASK5_HI
+            && addr < (uint32_t)RR3_MASK5_HI
+#endif
+#ifdef RR3_MASK5_GATE_TICK
+            && genesis_sim_tick_count() >= (uint32_t)RR3_MASK5_GATE_TICK
+#endif
+            )
+#endif
         ) {
         g_mask_tried++;
         if (rr3_mask_run(addr)) {

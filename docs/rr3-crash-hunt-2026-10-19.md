@@ -189,3 +189,39 @@ Side observations worth keeping:
 - The shipping list: performance pass, audio output, the cores
   0/1/3 split (sim / presenter / audio), the ambient-glow
   presentation, and a Select-button pause menu with save states.
+
+## Update — 2026-10-21 (evening): C and E named; F discovered
+
+- **Killer C is `func_0207EE` (dispatch idx 378).** The gated
+  chain finished cleanly: BV (376–384) died; BW (376–380) died;
+  BX (376–378) sailed past 18,797; BY (376–377) died at exactly
+  18,797. The one-function difference convicts idx 378.
+- **Killer E is `func_03A50A` (dispatch idx 606).** With C
+  substituted, build BZ re-baselined the E death at 20,027. The
+  sweep then walked the table: CA (idx 0–409), CB (410–523) and
+  CC (524–580) all died at E's tick, acquitting the low table;
+  **CD (the whole span 581–636) sailed and was still running when
+  stopped by hand at ~63,000 ticks** — the longest certified run
+  of the hunt, and proof E is dispatched inside 581–636 (not a
+  direct-call ghost). CE (581–608) sailed; CF (581–594), CG
+  (595–601) and CH (602–605) died, confining E to idx 606–608;
+  CI (606–607) sailed, acquitting 608; CJ substituted 606 alone,
+  sailed, and **convicted `func_03A50A`** — `func_03A53C` (607)
+  is acquitted. E's death tick wobbles with configuration
+  (19,985 / 20,027 / 20,041 / 20,042) — the same neighborhood
+  delay signature C showed at BS (18,811 = 18,797 + 14).
+- **Killer F discovered at tick exactly 27,452.** CI's run,
+  after sailing past E, kept going and died at 27,452; CJ's run
+  died at the same tick. Set difference against CD's sail
+  confines F to dispatched idx 581–636 excluding 606/607 — 54
+  candidates. F was invisible until E was suppressed: every
+  build since BZ died at E first. The death order on the demo
+  path is now A 5,353 → B 5,579 → C 18,797 → E ~20,027 →
+  F 27,452.
+- **Tooling grew:** a fourth gated mask range (MASK4) was added
+  for the E bisect, a fifth (MASK5) for F; convicted killers
+  ride permanently (E via MASK4 with gate 0). From build CF the
+  on-screen stats carry a build stamp (`BUILD <letter>` /
+  `#<count>`, top-right) so each hardware verdict names its
+  binary. Build CK opens the F bisect: idx 581–608 substituted
+  from tick 26,600.

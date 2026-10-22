@@ -20,8 +20,8 @@ repository, in any form. Developed against the USA/Europe ROM
 - **PC build (in `engine/`): complete** — full speed with sound, races and
   two-player split-screen, verified over long play sessions.
 - **Vita build: in active development, and the crash hunt has had a big
-  week (updated 2026-10-21).** There turned out to be **two separate
-  deaths**, not one:
+  week (updated 2026-10-21, evening).** There turned out to be **two
+  separate deaths**, not one:
 
   - **The interpreter death — SOLVED.** The engine's reference interpreter
     (used as a diagnostic backend) died inside the very first emulated
@@ -63,13 +63,28 @@ repository, in any form. Developed against the USA/Europe ROM
       (`RR3_MASK3_GATE_TICK`): a substitution range engages only just
       before the death under study, cutting exposure by >95% and
       making late-death bisections trustworthy again.
-    - **"Killer C" (the third death, tick 18,797) is confined to 17
-      candidate functions** (guest `0x20608`–`0x21748`); naming it is
-      the current work.
-    - **A fourth death, "Killer E", was found behind C** at demo tick
-      ~19,985–20,027 (the exact tick shifts slightly with the build's
-      substitution configuration), native in every configuration seen
-      so far. It is queued behind C.
+    - **"Killer C" is named: guest function `func_0207EE`** (the third
+      death, tick 18,797), convicted 2026-10-21 by a one-function
+      split: substituting dispatch idx 376–378 sailed past 18,797,
+      substituting only 376–377 died on the tick.
+    - **"Killer E" is named: guest function `func_03A50A`** (the
+      fourth death, demo tick ~19,985–20,042 — the exact tick shifts
+      slightly with the build's substitution configuration). Its
+      campaign included the longest certified run of the hunt: build
+      CD, substituting the whole candidate span, was still running
+      when stopped by hand at ~63,000 ticks. The final split came
+      down to two adjacent functions; build CJ substituted
+      `func_03A50A` alone and sailed.
+    - **A fifth death, "Killer F", stood behind E** at demo tick
+      exactly 27,452 (identical in two different configurations).
+      Comparing CD's 63,000-tick sail against the builds that died
+      confines F to dispatch idx 581–636 excluding the two E
+      candidates — 54 functions. Its bisection is the current work
+      (build CK onward; the mask system now has five ranges, the
+      fifth added for F).
+    - Test builds from CF onward stamp their identity on screen
+      (`BUILD <letter>` / `#<count>`, top-right) at the owner's
+      request, so every hardware verdict is tied to a known binary.
     - The earlier subsystem bisections stand: the Z80, audio renderer,
       DMA, H/V-interrupt delivery, display path, threading topology,
       stacks, and both compiler-optimization axes were all cleared
@@ -80,16 +95,15 @@ repository, in any form. Developed against the USA/Europe ROM
 
 ## What's next
 
-1. Finish naming Killer C (17 candidate functions left), then bisect
-   Killer E the same way.
+1. Finish naming Killer F (54 candidate functions, bisect under way).
 2. Read the convicted functions' generated code against the interpreter
    to identify the actual codegen defect(s); the prime suspects are the
    recomp's split-stack / skip-return bookkeeping paths.
 3. Convert the mask workaround into a permanent, targeted fix (the
    convicted functions are small and called rarely; running them
    interpreted permanently costs nothing measurable).
-4. Long soak test (well past 20k attract ticks) to prove no further
-   deaths are hiding behind E.
+4. Long soak test (well past 63k attract ticks — the current certified
+   benchmark) to prove no further deaths are hiding behind F.
 5. Then the shipping list: performance pass, audio output, splitting
    the work across Vita cores 0/1/3 (sim / presenter / audio), the
    final presentation (pixel-perfect view with an ambient-glow fill),
