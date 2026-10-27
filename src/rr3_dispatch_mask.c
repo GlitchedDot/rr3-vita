@@ -16,6 +16,102 @@
 #include "sim_step.h"
 
 uint32_t g_mask_tried = 0, g_mask_hit = 0;
+/* guest address of the most recent masked dispatch (build CT
+ * forensics: the front-end polls g_mask_tried between steps and
+ * logs this alongside, so capsule runs are tick-stamped in the
+ * breadcrumb without any stdio from the dispatch path itself) */
+uint32_t g_mask_last_addr = 0;
+
+/* Build CV call ring: every dispatch (recomp_dispatch_once) and every
+ * direct call (recomp_call_func, reverse-mapped through the dispatch
+ * table) pushes its guest address + sim tick here. Plain stores only —
+ * this path runs on the game fiber and never does IO; the front-end
+ * drains the ring into the breadcrumb (see main.c). The ring exists so
+ * direct-called functions, which bypass the dispatch (and therefore
+ * the mask and the capsule log), leave a trace too. */
+#define RR3_CALL_RING_SIZE 512u
+volatile uint32_t g_call_ring_addr[RR3_CALL_RING_SIZE];
+volatile uint32_t g_call_ring_tick[RR3_CALL_RING_SIZE];
+volatile uint32_t g_call_ring_head = 0;
+
+static void rr3_call_ring_push(uint32_t addr) {
+    uint32_t h = g_call_ring_head;
+    uint32_t slot = h & (RR3_CALL_RING_SIZE - 1u);
+    g_call_ring_addr[slot] = addr;
+    g_call_ring_tick[slot] = genesis_sim_tick_count();
+    g_call_ring_head = h + 1u;
+}
+
+#ifdef RR3_TABLE_MASK
+/* Build DA: table-driven mask over every function first sighted in a
+ * combat window across the CV/CW/CX/CY/CZ races that is not already
+ * convicted or exonerated (extents taken from the dispatch table).
+ * Tests in one run whether the gameplay killer is anywhere in the
+ * named set: if DA sails through fights, split down from here; if it
+ * still dies, the killer is outside call-entry instrumentation. */
+static const struct { uint32_t lo, hi; } s_table_mask[] = {
+    { 0x017C14u, 0x017F6Eu },
+    { 0x0181D0u, 0x0181EAu },
+    { 0x01A718u, 0x01A86Eu },
+    { 0x01ABB2u, 0x01AC16u },
+    { 0x01B414u, 0x01B4ECu },
+    { 0x01B4ECu, 0x01B5CAu },
+    { 0x01C438u, 0x01C482u },
+    { 0x01C482u, 0x01C4E4u },
+    { 0x01D21Cu, 0x01D228u },
+    { 0x01D386u, 0x01D406u },
+    { 0x01D406u, 0x01D532u },
+    { 0x01E0ACu, 0x01E0F0u },
+    { 0x01EAF6u, 0x01EB36u },
+    { 0x01EB36u, 0x01ED80u },
+    { 0x020608u, 0x02075Cu },
+    { 0x020D2Cu, 0x020F04u },
+    { 0x0211A6u, 0x0211E6u },
+    { 0x02138Au, 0x02140Cu },
+    { 0x021486u, 0x02172Cu },
+    { 0x02172Cu, 0x021748u },
+    { 0x021EBEu, 0x021FA0u },
+    { 0x02207Au, 0x0220AEu },
+    { 0x02266Eu, 0x0226C0u },
+    { 0x022A4Cu, 0x022B86u },
+    { 0x0231AEu, 0x0231C0u },
+    { 0x023564u, 0x0235FEu },
+    { 0x02370Au, 0x02378Cu },
+    { 0x02378Cu, 0x023828u },
+    { 0x023828u, 0x02384Eu },
+    { 0x0239B2u, 0x023ACAu },
+    { 0x023ACAu, 0x023B28u },
+    { 0x0241B8u, 0x0241F0u },
+    { 0x0241F0u, 0x024302u },
+    { 0x02491Eu, 0x024950u },
+    { 0x024982u, 0x0249AAu },
+    { 0x0249AAu, 0x024A4Cu },
+    { 0x024C0Cu, 0x024C48u },
+    { 0x024C48u, 0x024C88u },
+    { 0x025370u, 0x025438u },
+    { 0x025892u, 0x025896u },
+    { 0x025896u, 0x02589Au },
+    { 0x0258DCu, 0x025918u },
+    { 0x025918u, 0x025986u },
+    { 0x0259A6u, 0x0259D6u },
+    { 0x02834Au, 0x0283AAu },
+    { 0x028D9Cu, 0x028DC6u },
+    { 0x028E18u, 0x028E4Cu },
+    { 0x03AF74u, 0x03AFBEu },
+};
+
+static int rr3_table_masked(uint32_t addr) {
+    int lo = 0, hi = (int)(sizeof(s_table_mask) / sizeof(s_table_mask[0]));
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (addr < s_table_mask[mid].lo) hi = mid;
+        else if (addr >= s_table_mask[mid].hi) lo = mid + 1;
+        else return 1;
+    }
+    return 0;
+}
+#endif /* RR3_TABLE_MASK */
+
 static int rr3_mask_run(uint32_t addr) {
     uint32_t expected_ret = glue_peek32(g_cpu.A[7]) & 0xFFFFFFu;
     if (!expected_ret || (expected_ret & 1u))
@@ -1329,6 +1425,37 @@ static FuncPtr recomp_find_func(uint32_t addr) {
          ? s_dispatch_table[lo].fn : NULL;
 }
 
+/* Build CV: reverse map a C function pointer back to its guest address
+ * (for the call ring). The index is built once, sorted by pointer, and
+ * binary-searched per direct call. Returns 0xFFFFFFFF when unmapped. */
+static int s_rev_idx[637];
+static int s_rev_ready = 0;
+
+static void rr3_rev_build(void) {
+    for (int i = 0; i < 637; i++) s_rev_idx[i] = i;
+    for (int i = 1; i < 637; i++) {
+        int v = s_rev_idx[i], j = i - 1;
+        while (j >= 0 && s_dispatch_table[s_rev_idx[j]].fn > s_dispatch_table[v].fn) {
+            s_rev_idx[j + 1] = s_rev_idx[j];
+            j--;
+        }
+        s_rev_idx[j + 1] = v;
+    }
+    s_rev_ready = 1;
+}
+
+static uint32_t rr3_reverse_lookup(FuncPtr fn) {
+    if (!s_rev_ready) rr3_rev_build();
+    int lo = 0, hi = 637;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (s_dispatch_table[s_rev_idx[mid]].fn < fn) lo = mid + 1;
+        else hi = mid;
+    }
+    return (lo < 637 && s_dispatch_table[s_rev_idx[lo]].fn == fn)
+         ? s_dispatch_table[s_rev_idx[lo]].addr : 0xFFFFFFFFu;
+}
+
 int game_dispatch_table_size(void) { return 637; }
 uint32_t game_dispatch_table_addr(int i) {
     return (i >= 0 && i < 637) ? s_dispatch_table[i].addr : 0;
@@ -1383,6 +1510,7 @@ static void recomp_dispatch_once(uint32_t addr) {
     addr = recomp_resolve_ram_trampoline(addr);
     if (recomp_dispatch_ram_stub(addr))
         return;
+    rr3_call_ring_push(addr);
 #ifdef RR3_MASK_LO
     if ((addr >= (uint32_t)RR3_MASK_LO
 #ifdef RR3_MASK_HI
@@ -1426,8 +1554,65 @@ static void recomp_dispatch_once(uint32_t addr) {
 #endif
             )
 #endif
+#ifdef RR3_MASK6_LO
+        || (addr >= (uint32_t)RR3_MASK6_LO
+#ifdef RR3_MASK6_HI
+            && addr < (uint32_t)RR3_MASK6_HI
+#endif
+#ifdef RR3_MASK6_GATE_TICK
+            && genesis_sim_tick_count() >= (uint32_t)RR3_MASK6_GATE_TICK
+#endif
+            )
+#endif
+#ifdef RR3_MASK7_LO
+        || (addr >= (uint32_t)RR3_MASK7_LO
+#ifdef RR3_MASK7_HI
+            && addr < (uint32_t)RR3_MASK7_HI
+#endif
+#ifdef RR3_MASK7_GATE_TICK
+            && genesis_sim_tick_count() >= (uint32_t)RR3_MASK7_GATE_TICK
+#endif
+            )
+#endif
+#ifdef RR3_MASK8_LO
+        || (addr >= (uint32_t)RR3_MASK8_LO
+#ifdef RR3_MASK8_HI
+            && addr < (uint32_t)RR3_MASK8_HI
+#endif
+#ifdef RR3_MASK8_GATE_TICK
+            && genesis_sim_tick_count() >= (uint32_t)RR3_MASK8_GATE_TICK
+#endif
+            )
+#endif
+#ifdef RR3_MASK9_LO
+        || (addr >= (uint32_t)RR3_MASK9_LO
+#ifdef RR3_MASK9_HI
+            && addr < (uint32_t)RR3_MASK9_HI
+#endif
+#ifdef RR3_MASK9_GATE_TICK
+            && genesis_sim_tick_count() >= (uint32_t)RR3_MASK9_GATE_TICK
+#endif
+            )
+#endif
+#ifdef RR3_MASK10_LO
+        || (addr >= (uint32_t)RR3_MASK10_LO
+#ifdef RR3_MASK10_HI
+            && addr < (uint32_t)RR3_MASK10_HI
+#endif
+#ifdef RR3_MASK10_GATE_TICK
+            && genesis_sim_tick_count() >= (uint32_t)RR3_MASK10_GATE_TICK
+#endif
+            )
+#endif
+#ifdef RR3_MASK11_LO
+        || (addr >= (uint32_t)RR3_MASK11_LO && addr < (uint32_t)RR3_MASK11_HI)
+#endif
+#ifdef RR3_TABLE_MASK
+        || rr3_table_masked(addr)
+#endif
         ) {
         g_mask_tried++;
+        g_mask_last_addr = addr;
         if (rr3_mask_run(addr)) {
             g_mask_hit++;
             return;
@@ -1461,6 +1646,59 @@ static void recomp_drain_tailcalls(RecompTailFrame *frame) {
 void recomp_call_func(RecompFuncPtr fn) {
     if (!fn)
         return;
+    { uint32_t a = rr3_reverse_lookup((FuncPtr)fn);
+      if (a != 0xFFFFFFFFu) rr3_call_ring_push(a);
+      /* Build CW/CX: the dispatch mask cannot see direct calls, so the
+       * direct-only mask ranges (MASK6, MASK7) are honored here too —
+       * a masked direct-called function runs through the checkpoint
+       * capsule instead of its native body. The guest stack at this
+       * point has the same shape as at a dispatch (the caller already
+       * pushed the JSR return), which is what rr3_mask_run expects.
+       * Counters mirror the dispatch path exactly (CX fix: CW's branch
+       * never counted, leaving its capsule runs invisible). */
+      int direct_masked = 0;
+#ifdef RR3_MASK6_LO
+      if (a >= (uint32_t)RR3_MASK6_LO && a < (uint32_t)RR3_MASK6_HI)
+          direct_masked = 1;
+#endif
+#ifdef RR3_MASK7_LO
+      if (a >= (uint32_t)RR3_MASK7_LO && a < (uint32_t)RR3_MASK7_HI)
+          direct_masked = 1;
+#endif
+#ifdef RR3_MASK8_LO
+      if (a >= (uint32_t)RR3_MASK8_LO && a < (uint32_t)RR3_MASK8_HI)
+          direct_masked = 1;
+#endif
+#ifdef RR3_MASK9_LO
+      if (a >= (uint32_t)RR3_MASK9_LO && a < (uint32_t)RR3_MASK9_HI)
+          direct_masked = 1;
+#endif
+#ifdef RR3_MASK10_LO
+      if (a >= (uint32_t)RR3_MASK10_LO && a < (uint32_t)RR3_MASK10_HI)
+          direct_masked = 1;
+#endif
+#ifdef RR3_MASK11_LO
+      if (a >= (uint32_t)RR3_MASK11_LO && a < (uint32_t)RR3_MASK11_HI)
+          direct_masked = 1;
+#endif
+#ifdef RR3_TABLE_MASK
+      if (rr3_table_masked(a))
+          direct_masked = 1;
+#endif
+      if (direct_masked) {
+          RecompTailFrame frame = { 0, 0, g_recomp_tail_frame };
+          g_recomp_tail_frame = &frame;
+          g_mask_tried++;
+          g_mask_last_addr = a;
+          if (rr3_mask_run(a))
+              g_mask_hit++;
+          else
+              fn();
+          recomp_drain_tailcalls(&frame);
+          g_recomp_tail_frame = frame.prev;
+          return;
+      }
+    }
     RecompTailFrame frame = { 0, 0, g_recomp_tail_frame };
     g_recomp_tail_frame = &frame;
     fn();

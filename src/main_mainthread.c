@@ -185,20 +185,28 @@ static void draw_stats(uint32_t *dst)
     draw_text(dst, 12, 10, line);
     snprintf(line, sizeof line, "SIM %.2f ROLL %.2f", s_stat_sim_ms, s_stat_roll_ms);
     draw_text(dst, 12, 28, line);
+}
+
 #ifdef RR3_BUILD_LABEL
-    /* build identity, top-right (Lola's request, build CF onward):
-     * which build this is, and how many builds the hunt has run */
+/* build identity, top-right (Lola's request, build CF onward).
+ * Drawn unconditionally from CP onward: it used to sit inside
+ * draw_stats behind the s_stats_on gate, and Lola reported
+ * "no build" on CO — the stamp must not depend on the stats
+ * overlay state. */
+static void draw_build_stamp(uint32_t *dst)
+{
     for (int y = 6; y < 46; y++)
         for (int x = SCR_W - 174; x < SCR_W - 6; x++)
             dst[y * SCR_W + x] = 0xE8101010u;
+    char line[64];
     snprintf(line, sizeof line, "BUILD %s", RR3_BUILD_LABEL_STR);
     draw_text(dst, SCR_W - 12 - (int)strlen(line) * 18, 10, line);
 #ifdef RR3_BUILD_NUMBER
     snprintf(line, sizeof line, "#%d", RR3_BUILD_NUMBER);
     draw_text(dst, SCR_W - 12 - (int)strlen(line) * 18, 28, line);
 #endif
-#endif
 }
+#endif
 
 static void display_present(void)
 {
@@ -215,6 +223,9 @@ static void display_present(void)
         }
     }
     draw_stats(dst);
+#ifdef RR3_BUILD_LABEL
+    draw_build_stamp(dst);
+#endif
     SceDisplayFrameBuf fb;
     memset(&fb, 0, sizeof fb);
     fb.size = sizeof fb;

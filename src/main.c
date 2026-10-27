@@ -185,19 +185,42 @@ static void draw_stats(uint32_t *dst)
     draw_text(dst, 12, 10, line);
     snprintf(line, sizeof line, "SIM %.2f ROLL %.2f", s_stat_sim_ms, s_stat_roll_ms);
     draw_text(dst, 12, 28, line);
+}
+
 #ifdef RR3_BUILD_LABEL
-    /* build identity, top-right (Lola's request, build CF onward):
-     * which build this is, and how many builds the hunt has run */
+/* build identity, top-right (Lola's request, build CF onward).
+ * Drawn unconditionally from CP onward: it used to sit inside
+ * draw_stats behind the s_stats_on gate, and Lola reported
+ * "no build" on CO — the stamp must not depend on the stats
+ * overlay state. */
+static void draw_build_stamp(uint32_t *dst)
+{
     for (int y = 6; y < 46; y++)
         for (int x = SCR_W - 174; x < SCR_W - 6; x++)
             dst[y * SCR_W + x] = 0xE8101010u;
+    char line[64];
     snprintf(line, sizeof line, "BUILD %s", RR3_BUILD_LABEL_STR);
     draw_text(dst, SCR_W - 12 - (int)strlen(line) * 18, 10, line);
 #ifdef RR3_BUILD_NUMBER
     snprintf(line, sizeof line, "#%d", RR3_BUILD_NUMBER);
     draw_text(dst, SCR_W - 12 - (int)strlen(line) * 18, 28, line);
 #endif
+}
 #endif
+
+/* What this build is doing, in plain words, bottom-left (Lola's
+ * request, build CT onward): so a test build explains itself on
+ * screen without her having to remember which letter hunts what.
+ * Edit RR3_PURPOSE_TEXT per build; keep it short and simple. */
+#define RR3_PURPOSE_TEXT "DG: RETEST WITHOUT 027B84 MASK"
+static void draw_purpose_stamp(uint32_t *dst)
+{
+    const char *line = RR3_PURPOSE_TEXT;
+    int w = 12 + (int)strlen(line) * 18 + 12;
+    for (int y = SCR_H - 32; y < SCR_H - 6; y++)
+        for (int x = 6; x < w; x++)
+            dst[y * SCR_W + x] = 0xE8101010u;
+    draw_text(dst, 12, SCR_H - 28, line);
 }
 
 static void display_present(void)
@@ -215,6 +238,10 @@ static void display_present(void)
         }
     }
     draw_stats(dst);
+#ifdef RR3_BUILD_LABEL
+    draw_build_stamp(dst);
+    draw_purpose_stamp(dst);
+#endif
     SceDisplayFrameBuf fb;
     memset(&fb, 0, sizeof fb);
     fb.size = sizeof fb;
@@ -340,9 +367,27 @@ static int sim_thread(SceSize args, void *argp)
     uint64_t last = sceKernelGetProcessTimeWide();
     double roll_ms = 0.0, step_ms = 0.0;
     unsigned frames = 0;
+    uint16_t prev_pad = 0;
+    uint32_t prev_mask_tried = 0;
     s_stats_on = 1;
     for (;;) {
         in.pad[0] = read_pad();
+        /* Build CS input forensics: log every CHANGE in the Genesis
+         * pad stream — the exact bits the game is about to receive —
+         * tick-stamped, written from this thread in the same pattern
+         * as breadcrumb() (never from the game fiber). If the process
+         * dies suddenly, the last inputs Lola actually made are
+         * already in the file, so the death can be read against them. */
+        if (in.pad[0] != prev_pad) {
+            FILE *pf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+            if (pf) {
+                fprintf(pf, "input tick=%u pad=%04X prev=%04X\n",
+                        (unsigned)genesis_sim_tick_count(),
+                        (unsigned)in.pad[0], (unsigned)prev_pad);
+                fclose(pf);
+            }
+            prev_pad = in.pad[0];
+        }
         uint64_t ts0 = sceKernelGetProcessTimeWide();
         genesis_sim_step(&in, &s_audio, &s_hooks);
         uint64_t ts1 = sceKernelGetProcessTimeWide();
@@ -350,13 +395,67 @@ static int sim_thread(SceSize args, void *argp)
         s_stat_tick = (unsigned)genesis_sim_tick_count();
         s_stat_sim_ms = step_ms;
         s_stat_roll_ms = roll_ms;
+#ifdef RR3_MASK_LO
+        /* Build CT capsule forensics: poll the mask counters from
+         * this thread after each step — when a masked (killer)
+         * function was dispatched during the step, log it with its
+         * guest address. Polling here keeps all stdio on the sim
+         * thread; the dispatch path itself only stores the address
+         * (g_mask_last_addr), never does IO. */
+        { extern uint32_t g_mask_tried, g_mask_hit, g_mask_last_addr;
+          if (g_mask_tried != prev_mask_tried) {
+              FILE *cf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (cf) { fprintf(cf, "capsule tick=%u addr=%06X tried=%u hit=%u\n",
+                                (unsigned)genesis_sim_tick_count(),
+                                (unsigned)g_mask_last_addr,
+                                (unsigned)g_mask_tried,
+                                (unsigned)g_mask_hit);
+                        fclose(cf); }
+              prev_mask_tried = g_mask_tried;
+          } }
+        /* Build CV call-ring drain: log the first sighting of every
+         * guest function called this session — dispatch or direct —
+         * and snapshot the ring's last 8 entries every 600 frames.
+         * The ring itself is written with plain stores on the game
+         * fiber; all stdio happens here, between steps. */
+        { extern volatile uint32_t g_call_ring_addr[], g_call_ring_tick[],
+                                   g_call_ring_head;
+          static uint32_t call_drained = 0;
+          static uint8_t call_seen[0x200000 / 8];
+          uint32_t head = g_call_ring_head;
+          FILE *cf = NULL;
+          if (head - call_drained > 512u) call_drained = head - 512u;
+          while (call_drained != head) {
+              uint32_t slot = call_drained & 511u;
+              uint32_t a = g_call_ring_addr[slot];
+              uint32_t t = g_call_ring_tick[slot];
+              call_drained++;
+              if (a >= 0x200000u) continue;
+              if (call_seen[a >> 3] & (uint8_t)(1u << (a & 7u))) continue;
+              call_seen[a >> 3] |= (uint8_t)(1u << (a & 7u));
+              if (!cf) cf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (cf) fprintf(cf, "call tick=%u addr=%06X\n",
+                              (unsigned)t, (unsigned)a);
+          }
+          if ((frames % 600) == 0 && head >= 1u) {
+              if (!cf) cf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (cf) { fprintf(cf, "tail tick=%u",
+                                  (unsigned)genesis_sim_tick_count());
+                        for (uint32_t k = (head >= 8u ? head - 8u : 0u);
+                             k < head; k++)
+                            fprintf(cf, " %06X",
+                                    (unsigned)g_call_ring_addr[k & 511u]);
+                        fprintf(cf, "\n"); }
+          }
+          if (cf) fclose(cf); }
+#endif
         display_present();
 
         uint64_t now = sceKernelGetProcessTimeWide();
         roll_ms = roll_ms * 0.9 + ((double)(now - last) / 1000.0) * 0.1;
         last = now;
         frames++;
-        if ((frames % 60) == 0) breadcrumb("play", roll_ms);
+        if ((frames % 20) == 0) breadcrumb("play", roll_ms);
 #ifdef RR3_MASK_LO
         if ((frames % 1200) == 0) {
             extern uint32_t g_mask_tried, g_mask_hit;
