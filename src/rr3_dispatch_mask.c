@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <psp2/io/fcntl.h>
 
 /* [MASK] RR3 native-death bisect (build AL+): guest functions at/above
  * RR3_MASK_LO are executed by the framed interpreter capsule instead of
@@ -21,6 +22,82 @@ uint32_t g_mask_tried = 0, g_mask_hit = 0;
  * logs this alongside, so capsule runs are tick-stamped in the
  * breadcrumb without any stdio from the dispatch path itself) */
 uint32_t g_mask_last_addr = 0;
+
+/* Build DH 01A718 capsule forensics: when a capsule run FAILS, record
+ * exactly why — interp status (0=OK-but-exit-mismatch, 1=UNIMPL,
+ * 2=GUARD, 3=BADADDR, 99=no plausible return on the stack), the bad
+ * pc/op for UNIMPL, the exit pc vs the expected return, and A7 at
+ * failure — plus a fallback tracker (state 1 = native fallback
+ * entered after a failed capsule, 2 = it returned). Plain stores
+ * only; the front-end polls and prints (see main.c). */
+uint32_t g_mask_fail_count = 0;
+uint32_t g_mask_fail_addr = 0;
+uint32_t g_mask_fail_status = 0;
+uint32_t g_mask_fail_badpc = 0;
+uint32_t g_mask_fail_badop = 0;
+uint32_t g_mask_fail_exit = 0;
+uint32_t g_mask_fail_want = 0;
+uint32_t g_mask_fail_sp = 0;
+uint32_t g_mask_fb_seq = 0;
+uint32_t g_mask_fb_addr = 0;
+uint32_t g_mask_fb_state = 0;
+
+/* Build DK: the DH failure record dies with the process when the crash
+ * follows the failed capsule inside the same step (DJ: 01A718 failed at
+ * tick 13316 and no poll ever printed it). The front-end therefore
+ * pre-opens ux0:/data/rr3vita/maskfail.txt at boot and stores the fd
+ * here; on the FIRST capsule failure of the session, note_fail issues
+ * exactly ONE sceIoWrite of the record (snprintf is pure computation;
+ * sceIoWrite is a single kernel call, not stdio). One shot per boot:
+ * in the whole hunt the only real capsule failure is 01A718's, so the
+ * write fires exactly where the answer is needed. */
+int32_t g_mask_forensic_fd = -1;
+
+/* Build DL: DK's one-shot file came back EMPTY — the failure record
+ * exists in memory but neither the between-steps poll (crash follows
+ * inside the same step) nor the in-step kernel write (bytes never
+ * became durable) can get it out. So DL makes the failure SURVIVABLE:
+ * when func_01A718's capsule fails with a valid return address on the
+ * stack, the dispatch emulates a bare return (pop + PC = return,
+ * registers as at call time) instead of running the native fallback.
+ * The results table stays unbuilt — downstream may misbehave — but
+ * the process should live long enough for the ordinary poll channel
+ * to print the maskfail + maskskip records. Only 01A718 gets the
+ * skip; every other function keeps the native fallback. */
+uint32_t g_mask_skip_count = 0;
+uint32_t g_mask_skip_addr = 0;
+
+/* Build DP: DO still died inside the fatal step (capsule failed at
+ * tick 14928, no poll ever printed), so the record needs the process
+ * to STOP, not die. On any 01A718 capsule failure, set this flag:
+ * every later dispatch/direct call becomes a no-op so the current
+ * step unwinds immediately, and the front-end halts stepping while
+ * continuing to render — the FAIL stamp stays on screen and a
+ * maskfreeze line lands in the breadcrumb. Plain stores only. */
+uint32_t g_mask_freeze = 0;
+
+static void rr3_mask_note_fail(uint32_t addr, uint32_t status,
+                               uint32_t exit_pc, uint32_t want) {
+    g_mask_fail_addr = addr;
+    g_mask_fail_status = status;
+    g_mask_fail_badpc = g_m68ki_bad_pc;
+    g_mask_fail_badop = g_m68ki_bad_op;
+    g_mask_fail_exit = exit_pc;
+    g_mask_fail_want = want;
+    g_mask_fail_sp = g_cpu.A[7];
+    g_mask_fail_count++;
+    /* Build DO: the DK one-shot sceIoWrite block is REMOVED. It
+     * produced exactly one record (DN: 185E3E st=99) and DN died in
+     * the very step that performed it — file IO on the game fiber is
+     * poison (the AJ rule). The record now escapes via the on-screen
+     * fail stamp + the ordinary poll. Pure stores only here. */
+}
+
+static void rr3_fb_note(uint32_t addr, uint32_t state) {
+    g_mask_fb_addr = addr;
+    g_mask_fb_state = state;
+    g_mask_fb_seq++;
+}
 
 /* Build CV call ring: every dispatch (recomp_dispatch_once) and every
  * direct call (recomp_call_func, reverse-mapped through the dispatch
@@ -54,8 +131,10 @@ static const struct { uint32_t lo, hi; } s_table_mask[] = {
     { 0x0181D0u, 0x0181EAu },
     { 0x01A718u, 0x01A86Eu },
     { 0x01ABB2u, 0x01AC16u },
+    { 0x01AF6Au, 0x01B414u },
     { 0x01B414u, 0x01B4ECu },
     { 0x01B4ECu, 0x01B5CAu },
+    { 0x01C1E8u, 0x01C3E8u },
     { 0x01C438u, 0x01C482u },
     { 0x01C482u, 0x01C4E4u },
     { 0x01D21Cu, 0x01D228u },
@@ -70,6 +149,9 @@ static const struct { uint32_t lo, hi; } s_table_mask[] = {
     { 0x02138Au, 0x02140Cu },
     { 0x021486u, 0x02172Cu },
     { 0x02172Cu, 0x021748u },
+    { 0x02176Eu, 0x021936u },
+    { 0x021A74u, 0x021DAEu },
+    { 0x021DAEu, 0x021E20u },
     { 0x021EBEu, 0x021FA0u },
     { 0x02207Au, 0x0220AEu },
     { 0x02266Eu, 0x0226C0u },
@@ -113,9 +195,41 @@ static int rr3_table_masked(uint32_t addr) {
 #endif /* RR3_TABLE_MASK */
 
 static int rr3_mask_run(uint32_t addr) {
+    /* Build DR: func_01A718 is NEVER executed — neither capsule nor
+     * native. DQ caught the process dying inside its capsule run
+     * (guest PC in func_027B84 at the final drain; the capsule never
+     * returned), and DC died with it fully native. So: bare return,
+     * using the peeked return when plausible, else the sole call
+     * site's pushed return (0x1860C8). The results table stays
+     * unbuilt — where the game trips next, if anywhere, is the
+     * information this build buys. */
+    if (addr == 0x01A718u) {
+        uint32_t r = glue_peek32(g_cpu.A[7]) & 0xFFFFFFu;
+        g_mask_skip_addr = addr;
+        g_mask_skip_count++;
+        g_cpu.A[7] += 4;
+        g_cpu.PC = (r && !(r & 1u)) ? r : 0x1860C8u;
+        return 1;
+    }
     uint32_t expected_ret = glue_peek32(g_cpu.A[7]) & 0xFFFFFFu;
-    if (!expected_ret || (expected_ret & 1u))
+    if (!expected_ret || (expected_ret & 1u)) {
+        rr3_mask_note_fail(addr, 99u, 0, expected_ret);
+        if (addr == 0x01A718u) {
+            /* Build DP freeze (st=99 arm): no plausible return on the
+             * stack — use the sole call site's pushed return
+             * (0x1860C8, rr3_part30.c) and stop the sim instead of
+             * running the native fallback that dies inside the step. */
+            g_mask_freeze = 1;
+            g_cpu.A[7] += 4;
+            g_cpu.PC = 0x1860C8u;
+            return 1;
+        }
+        /* Build DQ: freeze on any st=99 failure too — the native
+         * fallback still runs this once, but if it returns, the sim
+         * halts with the record on screen. */
+        g_mask_freeze = 1;
         return 0;
+    }
     M68KState checkpoint = g_cpu;
     uint32_t exit_pc = 0;
     M68kiStatus st = m68k_interp_run_framed(addr, &exit_pc);
@@ -124,8 +238,18 @@ static int rr3_mask_run(uint32_t addr) {
         g_cpu.PC = exit_pc;
         return 1;
     }
+    rr3_mask_note_fail(addr, (uint32_t)st, exit_pc, expected_ret);
     g_cpu = checkpoint;
-    return 0;
+    /* Build DQ: the DL/DP skip+freeze, generalized to EVERY masked
+     * function (was 01A718-only through DP). Any capsule failure
+     * bare-returns and freezes the sim, so the record reaches the
+     * screen and the breadcrumb instead of dying inside the step. */
+    g_mask_freeze = 1;
+    g_mask_skip_addr = addr;
+    g_mask_skip_count++;
+    g_cpu.A[7] += 4;
+    g_cpu.PC = expected_ret;
+    return 1;
 }
 
 typedef void (*FuncPtr)(void);
@@ -1507,6 +1631,8 @@ void recomp_tail_call(uint32_t addr) {
 }
 
 static void recomp_dispatch_once(uint32_t addr) {
+    int mask_failed = 0;
+    if (g_mask_freeze) return; /* Build DP: sim frozen — unwind fast */
     addr = recomp_resolve_ram_trampoline(addr);
     if (recomp_dispatch_ram_stub(addr))
         return;
@@ -1617,11 +1743,14 @@ static void recomp_dispatch_once(uint32_t addr) {
             g_mask_hit++;
             return;
         }
+        mask_failed = 1;
     }
 #endif
     FuncPtr fn = recomp_find_func(addr);
     if (fn) {
+        if (mask_failed) rr3_fb_note(addr, 1);
         fn();
+        if (mask_failed) rr3_fb_note(addr, 2);
         return;
     }
     if (!g_game_spec.dispatch_override || !g_game_spec.dispatch_override(addr))
@@ -1646,6 +1775,7 @@ static void recomp_drain_tailcalls(RecompTailFrame *frame) {
 void recomp_call_func(RecompFuncPtr fn) {
     if (!fn)
         return;
+    if (g_mask_freeze) return; /* Build DP: sim frozen — unwind fast */
     { uint32_t a = rr3_reverse_lookup((FuncPtr)fn);
       if (a != 0xFFFFFFFFu) rr3_call_ring_push(a);
       /* Build CW/CX: the dispatch mask cannot see direct calls, so the
@@ -1692,8 +1822,11 @@ void recomp_call_func(RecompFuncPtr fn) {
           g_mask_last_addr = a;
           if (rr3_mask_run(a))
               g_mask_hit++;
-          else
+          else {
+              rr3_fb_note(a, 1);
               fn();
+              rr3_fb_note(a, 2);
+          }
           recomp_drain_tailcalls(&frame);
           g_recomp_tail_frame = frame.prev;
           return;

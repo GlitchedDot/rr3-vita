@@ -17,6 +17,7 @@
  */
 #include <psp2/ctrl.h>
 #include <psp2/display.h>
+#include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
@@ -212,10 +213,28 @@ static void draw_build_stamp(uint32_t *dst)
  * request, build CT onward): so a test build explains itself on
  * screen without her having to remember which letter hunts what.
  * Edit RR3_PURPOSE_TEXT per build; keep it short and simple. */
-#define RR3_PURPOSE_TEXT "DG: RETEST WITHOUT 027B84 MASK"
+#define RR3_PURPOSE_TEXT "DR: 01A718 NEVER EXECUTES BARE RETURN"
 static void draw_purpose_stamp(uint32_t *dst)
 {
     const char *line = RR3_PURPOSE_TEXT;
+    /* Build DO: once a capsule failure is recorded (plain stores on
+     * the dispatch path), the stamp switches to the failure record —
+     * the main thread draws it every presented frame, so the record
+     * is visible on screen even if the process dies before the next
+     * breadcrumb poll. No IO, no fiber involvement. */
+    char failbuf[64];
+    { extern uint32_t g_mask_fail_count, g_mask_fail_addr,
+                      g_mask_fail_status, g_mask_fail_badpc,
+                      g_mask_fail_badop, g_mask_fail_exit,
+                      g_mask_fail_want;
+      if (g_mask_fail_count) {
+          snprintf(failbuf, sizeof failbuf,
+                   "FAIL %06X ST%u PC%06X OP%04X X%06X W%06X",
+                   (unsigned)g_mask_fail_addr, (unsigned)g_mask_fail_status,
+                   (unsigned)g_mask_fail_badpc, (unsigned)g_mask_fail_badop,
+                   (unsigned)g_mask_fail_exit, (unsigned)g_mask_fail_want);
+          line = failbuf;
+      } }
     int w = 12 + (int)strlen(line) * 18 + 12;
     for (int y = SCR_H - 32; y < SCR_H - 6; y++)
         for (int x = 6; x < w; x++)
@@ -265,6 +284,14 @@ static int sim_thread(SceSize args, void *argp)
 {
     (void)args; (void)argp;
     sceIoMkdir("ux0:/data/rr3vita", 0777);   /* exe_relative() target dir */
+    /* Build DK: pre-open the one-shot capsule-failure dump file; the
+     * dispatch path writes the first failure record into it with a
+     * single sceIoWrite (see rr3_dispatch_mask.c). */
+    { extern int32_t g_mask_forensic_fd;
+      SceUID mfd = sceIoOpen("ux0:/data/rr3vita/maskfail.txt",
+                             SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC,
+                             0777);
+      if (mfd >= 0) g_mask_forensic_fd = (int32_t)mfd; }
     boot_note("boot-start", 0);
 
     /* Display first this time: a dark-blue screen within the first
@@ -369,6 +396,10 @@ static int sim_thread(SceSize args, void *argp)
     unsigned frames = 0;
     uint16_t prev_pad = 0;
     uint32_t prev_mask_tried = 0;
+    uint32_t prev_mask_fail = 0;
+    uint32_t prev_fb_seq = 0;
+    uint32_t prev_mask_skip = 0;
+    uint32_t prev_mask_freeze = 0;
     s_stats_on = 1;
     for (;;) {
         in.pad[0] = read_pad();
@@ -389,7 +420,10 @@ static int sim_thread(SceSize args, void *argp)
             prev_pad = in.pad[0];
         }
         uint64_t ts0 = sceKernelGetProcessTimeWide();
-        genesis_sim_step(&in, &s_audio, &s_hooks);
+        /* Build DP: once frozen, stop stepping — keep rendering so
+         * the FAIL stamp stays on screen for Lola to read. */
+        { extern uint32_t g_mask_freeze;
+          if (!g_mask_freeze) genesis_sim_step(&in, &s_audio, &s_hooks); }
         uint64_t ts1 = sceKernelGetProcessTimeWide();
         step_ms = step_ms * 0.9 + ((double)(ts1 - ts0) / 1000.0) * 0.1;
         s_stat_tick = (unsigned)genesis_sim_tick_count();
@@ -413,11 +447,77 @@ static int sim_thread(SceSize args, void *argp)
                         fclose(cf); }
               prev_mask_tried = g_mask_tried;
           } }
+        /* Build DH: poll the capsule-failure record and the native
+         * fallback tracker (written with plain stores by the dispatch
+         * path; all stdio here, between steps, as usual). */
+        { extern uint32_t g_mask_fail_count, g_mask_fail_addr,
+                          g_mask_fail_status, g_mask_fail_badpc,
+                          g_mask_fail_badop, g_mask_fail_exit,
+                          g_mask_fail_want, g_mask_fail_sp;
+          if (g_mask_fail_count != prev_mask_fail) {
+              FILE *ff = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (ff) { fprintf(ff, "maskfail tick=%u addr=%06X st=%u badpc=%06X badop=%04X exit=%06X want=%06X sp=%08X\n",
+                                (unsigned)genesis_sim_tick_count(),
+                                (unsigned)g_mask_fail_addr,
+                                (unsigned)g_mask_fail_status,
+                                (unsigned)g_mask_fail_badpc,
+                                (unsigned)g_mask_fail_badop,
+                                (unsigned)g_mask_fail_exit,
+                                (unsigned)g_mask_fail_want,
+                                (unsigned)g_mask_fail_sp);
+                        fclose(ff); }
+              prev_mask_fail = g_mask_fail_count;
+          } }
+        { extern uint32_t g_mask_fb_seq, g_mask_fb_addr, g_mask_fb_state;
+          if (g_mask_fb_seq != prev_fb_seq) {
+              FILE *bf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (bf) { fprintf(bf, "fallback tick=%u addr=%06X state=%u\n",
+                                (unsigned)genesis_sim_tick_count(),
+                                (unsigned)g_mask_fb_addr,
+                                (unsigned)g_mask_fb_state);
+                        fclose(bf); }
+              prev_fb_seq = g_mask_fb_seq;
+          } }
+        /* Build DL: poll the 01A718 capsule-failure skip counter. */
+        { extern uint32_t g_mask_skip_count, g_mask_skip_addr;
+          if (g_mask_skip_count != prev_mask_skip) {
+              FILE *sf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (sf) { fprintf(sf, "maskskip tick=%u addr=%06X n=%u\n",
+                                (unsigned)genesis_sim_tick_count(),
+                                (unsigned)g_mask_skip_addr,
+                                (unsigned)g_mask_skip_count);
+                        fclose(sf); }
+              prev_mask_skip = g_mask_skip_count;
+          } }
+        /* Build DP: poll the freeze flag — print the failure record
+         * once, from this thread, now that the sim has stopped and
+         * the record cannot die with the process. */
+        { extern uint32_t g_mask_freeze, g_mask_fail_addr,
+                          g_mask_fail_status, g_mask_fail_badpc,
+                          g_mask_fail_badop, g_mask_fail_exit,
+                          g_mask_fail_want, g_mask_fail_sp;
+          if (g_mask_freeze && !prev_mask_freeze) {
+              FILE *zf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (zf) { fprintf(zf, "maskfreeze tick=%u addr=%06X st=%u badpc=%06X badop=%04X exit=%06X want=%06X sp=%08X\n",
+                                (unsigned)genesis_sim_tick_count(),
+                                (unsigned)g_mask_fail_addr,
+                                (unsigned)g_mask_fail_status,
+                                (unsigned)g_mask_fail_badpc,
+                                (unsigned)g_mask_fail_badop,
+                                (unsigned)g_mask_fail_exit,
+                                (unsigned)g_mask_fail_want,
+                                (unsigned)g_mask_fail_sp);
+                        fclose(zf); }
+              prev_mask_freeze = 1;
+          } }
         /* Build CV call-ring drain: log the first sighting of every
          * guest function called this session — dispatch or direct —
-         * and snapshot the ring's last 8 entries every 600 frames.
-         * The ring itself is written with plain stores on the game
-         * fiber; all stdio happens here, between steps. */
+         * and snapshot the ring's tail. Build DI: the snapshot now
+         * runs every 30 frames (was 600) and prints the last 32
+         * entries plus the current PC, so a sudden death leaves a
+         * fresh, wide last-calls window in the breadcrumb. The ring
+         * itself is written with plain stores on the game fiber;
+         * all stdio happens here, between steps. */
         { extern volatile uint32_t g_call_ring_addr[], g_call_ring_tick[],
                                    g_call_ring_head;
           static uint32_t call_drained = 0;
@@ -437,11 +537,15 @@ static int sim_thread(SceSize args, void *argp)
               if (cf) fprintf(cf, "call tick=%u addr=%06X\n",
                               (unsigned)t, (unsigned)a);
           }
-          if ((frames % 600) == 0 && head >= 1u) {
+          if (head >= 1u) { /* Build DQ: tail snapshot EVERY frame
+                             * (was every 30) — DP died <=20 ticks after
+                             * the last snapshot; shrink the blind
+                             * window to under one tick. */
               if (!cf) cf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
-              if (cf) { fprintf(cf, "tail tick=%u",
-                                  (unsigned)genesis_sim_tick_count());
-                        for (uint32_t k = (head >= 8u ? head - 8u : 0u);
+              if (cf) { fprintf(cf, "tail tick=%u pc=%06X",
+                                  (unsigned)genesis_sim_tick_count(),
+                                  (unsigned)(g_cpu.PC & 0xFFFFFFu));
+                        for (uint32_t k = (head >= 32u ? head - 32u : 0u);
                              k < head; k++)
                             fprintf(cf, " %06X",
                                     (unsigned)g_call_ring_addr[k & 511u]);
