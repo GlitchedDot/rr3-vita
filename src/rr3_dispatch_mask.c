@@ -127,6 +127,66 @@ static void rr3_call_ring_push(uint32_t addr) {
  * named set: if DA sails through fights, split down from here; if it
  * still dies, the killer is outside call-entry instrumentation. */
 static const struct { uint32_t lo, hi; } s_table_mask[] = {
+    /* Build EL: the standings trio joins the table mask — the
+     * class-3 front is closed (EK sailed; the transition completes
+     * with the late set capsuled), and per Lola's priority the
+     * standings display bugs are the next fix: the results screen
+     * shows PLAYER A 1st with $1000 though she did not finish
+     * first ("the first 3 positions not showing correctly"), and
+     * a ".0" renders in the times column beside every name.
+     * Desk read (scout pass, 2026-11-10): the results screen is
+     * built by func_014E5C (orchestrator, called from the frontend
+     * step in rr3_part30.c), which calls func_014BDA (builds/sorts
+     * the order table at guest 0xFF74E0 — the prime suspect for
+     * the wrong order: its sampled swap exchanges only the +2
+     * words of adjacent entries, and equal/uninitialised keys
+     * would leave roster order — PLAYER A first — standing) and
+     * func_0155BE (builds the text lines; feeds each line's time
+     * word to the MM:SS.T formatter func_0158D4 — ".0" on every
+     * line means every time word arrives a multiple of 10).
+     * Prizes are computed (base 100 x ROM multiplier [1,2,4,6,10]
+     * at rr3.bin 0x15EDC), so $1000-for-1st is downstream of the
+     * order, not a table bug. Capsuling all three (dispatch spans
+     * [014BDA,014E5C), [014E5C,014F32), [0155BE,0158D4); all are
+     * cleanly JSR-called) runs the whole standings construction
+     * interpreted. Pre-registered reads: standings correct on
+     * screen -> a native divergence inside this subtree (bisect
+     * within it); standings still wrong -> the records are wrong
+     * upstream (written during the race) and the hunt moves to
+     * the race-side writer. Cost: the trio runs only at race end,
+     * so racing speed is untouched. 014E5C is also in the late
+     * set; the table extent simply makes it permanent. */
+    { 0x014916u, 0x014A38u },
+    { 0x014A38u, 0x014BDAu },
+    { 0x014BDAu, 0x014E5Cu },
+    { 0x014E5Cu, 0x014F32u },
+    { 0x0155BEu, 0x0158D4u },
+    /* Build EM: the class-2 front (Lola's call 2026-11-10:
+     * stability first — reliable Track 2 starts before the
+     * standings fix). Desk facts: every class-2 death's final
+     * tail (written after the last COMPLETED step, every frame)
+     * parks at guest PC 01467E — inside func_014434, the per-frame
+     * racing function — with NO common final call across deaths
+     * (EC 01977E, ED 001A00, EE 03B55E, EJ 0188F4, EL 0199DA);
+     * the death is in the NEXT step, data-dependent (the same
+     * native code runs thousands of frames first). func_014434's
+     * direct-call children (recomp_call_func, which consults
+     * rr3_table_masked — the EE/0203E8 mechanism): ten addrs, of
+     * which only 01AF6A was already capsuled (and is thereby
+     * cleared as the sole cause). The other nine join the mask
+     * here as ONE SET — every direct call from 014434 runs
+     * interpreted, subtree included. Pre-registered reads: a
+     * capsule FAIL naming a member convicts it; a sail, or
+     * repeated survival past the historical death band (ticks
+     * ~3900-7600), implicates the set's native execution (bisect
+     * within the set; a surviving config is also a candidate
+     * stability fix); another clean class-2 death with the set
+     * tried=hit clears all nine at once and pushes the fault
+     * outside 014434's direct-call subtree — into 014434's own
+     * body or the non-guest host side. The standings trio above
+     * stays capsuled (harmless; runs only at race end). Cost:
+     * these are per-frame racing calls, so roll worsens — EM is
+     * an instrument first, a fix candidate second. */
     { 0x017C14u, 0x017F6Eu },
     { 0x0181D0u, 0x0181EAu },
     { 0x01A718u, 0x01A86Eu },
@@ -134,15 +194,40 @@ static const struct { uint32_t lo, hi; } s_table_mask[] = {
     { 0x01AF6Au, 0x01B414u },
     { 0x01B414u, 0x01B4ECu },
     { 0x01B4ECu, 0x01B5CAu },
+    /* Build EM (continued): the 014434-children set — the
+     * 01B7BC..01C7AC chain and 0256B2 (see the note above). */
+    { 0x01B7BCu, 0x01B8B0u },
+    { 0x01B8B0u, 0x01B9B4u },
+    { 0x01B9B4u, 0x01BADEu },
+    { 0x01BADEu, 0x01BC78u },
+    { 0x01BC78u, 0x01BDB8u },
     { 0x01C1E8u, 0x01C3E8u },
     { 0x01C438u, 0x01C482u },
     { 0x01C482u, 0x01C4E4u },
+    { 0x01C7ACu, 0x01CB66u },
     { 0x01D21Cu, 0x01D228u },
     { 0x01D386u, 0x01D406u },
     { 0x01D406u, 0x01D532u },
     { 0x01E0ACu, 0x01E0F0u },
     { 0x01EAF6u, 0x01EB36u },
     { 0x01EB36u, 0x01ED80u },
+    /* Build EE: func_0203E8 joins the table mask — the class-2
+     * pivot Lola chose after EC and ED both died mid-race on the
+     * fix config. 0203E8 is the race's per-entity workhorse,
+     * called DIRECTLY from guest $0142C2 (rr3_part11.c) via
+     * recomp_call_func, which consults rr3_table_masked — so this
+     * extent routes every such call through the capsule. Inside
+     * its body sits the dynamic handler JSR at $020556 (target
+     * loaded from the entity struct), the named class-2
+     * neighborhood: DT's death tail parked at its return point
+     * $020558. Pre-registered reads: a capsule FAIL naming 0203E8
+     * (freeze, record on screen) convicts the death to inside
+     * 0203E8's framed run; a clean class-2 death with 0203E8
+     * tried=hit clears it; sailing implicates its native
+     * execution. Cost accepted: the hot loop runs interpreted,
+     * so roll may worsen — EE is an instrument, not a perf
+     * build. Extent is its dispatch-table span [0203E8,020592). */
+    { 0x0203E8u, 0x020592u },
     { 0x020608u, 0x02075Cu },
     { 0x020D2Cu, 0x020F04u },
     { 0x0211A6u, 0x0211E6u },
@@ -171,6 +256,7 @@ static const struct { uint32_t lo, hi; } s_table_mask[] = {
     { 0x024C0Cu, 0x024C48u },
     { 0x024C48u, 0x024C88u },
     { 0x025370u, 0x025438u },
+    { 0x0256B2u, 0x0256FCu },
     { 0x025892u, 0x025896u },
     { 0x025896u, 0x02589Au },
     { 0x0258DCu, 0x025918u },
@@ -179,10 +265,146 @@ static const struct { uint32_t lo, hi; } s_table_mask[] = {
     { 0x02834Au, 0x0283AAu },
     { 0x028D9Cu, 0x028DC6u },
     { 0x028E18u, 0x028E4Cu },
-    { 0x03AF74u, 0x03AFBEu },
+    /* Build EC: func_029190 PERMANENTLY capsuled. EA convicted it
+     * outright (fade death returned with 029190 native alone, dying
+     * inside the 01A718 skip step; EB repeated the death with the
+     * speed dose aboard, so the conviction is timing-independent).
+     * Its dispatch extent [029190,029678) joins the table mask, so
+     * rr3_table_masked catches it on BOTH paths — dispatch and
+     * recomp_call_func — from boot, not just in the post-arm late
+     * window. This is the candidate shipping config while the
+     * desk-read of 029190's generated code hunts the real defect. */
+    { 0x029190u, 0x029678u },
+    /* Build EF: the hot-cluster set (the ten hottest tail-census
+     * targets from EE, capsuled as a SET from boot). EF TEST
+     * VERDICT (session 140): the run FINISHED THE RACE and CROSSED
+     * THE FADE — the first fix-config run to do either; 029190's
+     * permanent capsule is thereby validated end-to-end, and the
+     * hot set ran 539k+ capsules tried=hit with zero FAILs, so no
+     * class-2 death struck. Lola closed the still-running game
+     * herself. CORRECTION (Lola's screen report, 2026-11-10):
+     * after the fade a cutscene played and the game reached the
+     * 1st/2nd/3rd standings screen — the frozen-framebuffer tail
+     * (last change tick 15640, 0021B6 <-> 03A4A8 cycle at
+     * pc=186164) was that screen AT REST, not a stall. EF's
+     * pre-registered read for a sail applies: the hot set's
+     * native execution is implicated in class 2, as a set.
+     * Build EG: the A/B — the hot-ten extents are REMOVED again
+     * (this block), leaving EC's config (029190 + 0203E8
+     * permanent, dose kept). EC/ED/EE all died class-2 without
+     * the set; if EG dies too, the set gets bisected for class
+     * 2; if EG also sails, class 2 is murkier than the set
+     * theory. 03AF74's extent was an unlisted adjacent span
+     * inside EF's block; it leaves too. */
 };
 
+/* Build DV: the late set — func_185E3E's post-1860C8 direct-call
+ * targets (plus its tail-call target 185CE4), with dispatch-table
+ * extents. DU convicted the fade death to the step starting at
+ * 1860C8; these nine are that step's named calls, and they bypass
+ * the dispatch mask because they are called via recomp_call_func.
+ * rr3_table_masked is consulted on BOTH call paths, so once the set
+ * is armed (g_late_armed, set by the 01A718 skip arm in
+ * rr3_mask_run), the nine run through the capsule instead of their
+ * native bodies. Racing is untouched: the arm fires once, in the
+ * fade sequence, a step before the convicted frame. */
+uint32_t g_late_armed = 0;
+uint32_t g_late_count = 0;
+uint32_t g_late_last_addr = 0;
+static const struct { uint32_t lo, hi; } s_late_mask[] = {
+    /* Build EH: EG TESTED 2026-11-10 — full sail (race, fade,
+     * cutscene, standings) on the EC-family config, so the class-2
+     * hot-set theory weakens per its pre-registered read (b). But a
+     * NEW class-3 hang appeared: pressing on from the standings to
+     * the next track froze the guest (tick 23244 flat across 3,356
+     * polls, insn/yld/fbh identical, host roll still updating) — a
+     * native-side hang inside a step on the transition path. The
+     * frozen ring's cycle was 0021B6 0022E2 [hot set] 017A6A [hot
+     * set] 185CE4; 185CE4 and the rest of this late set were ALREADY
+     * interpreted post-arm in EG, so the hang lives in the still-
+     * native remainder. EH completes the late set so the ENTIRE
+     * post-race frontend cycle runs interpreted (racing untouched):
+     * 0021B6, 0022E2, 017A6A + the hot ten join below. Reads: (a)
+     * track 2 reached -> the set is convicted as a set; (b) same
+     * hang -> the site is outside the cycle set; (c) a FAIL names
+     * it.
+     * EH OUTCOME (2026-11-10): the FAIL came, but as an artifact —
+     * maskfail tick=12311 addr=0021B6 st=99 want=000000 sp=00FFFFF6,
+     * one tick after the arm. st=99 is rr3_mask_run's pre-flight
+     * guard: [A7] held no return address. func_0021B6 is a
+     * register-saving thunk (MOVEM x15, dynamic JSR via the pointer
+     * at 0x00FF0226) reached only through dispatch and entered by
+     * JUMP-chaining — no return sits at [A7] on entry, so the
+     * capsule model can never run it. EI (#139) REMOVES 0021B6 from
+     * this set; the rest of EH's completion stays. If 0022E2 or
+     * 017A6A also fail st=99 they are jump-entered too — strip and
+     * repeat; if EI hangs at the press with the rest capsuled, the
+     * site is native 0021B6 or deeper (log it, don't capsule it). */
+    { 0x002220u, 0x002260u },
+    { 0x002260u, 0x0022A0u },
+    { 0x0022E2u, 0x002398u },
+    { 0x00AC48u, 0x00B186u },
+    { 0x013088u, 0x0131D6u },
+    { 0x014E5Cu, 0x014F32u },
+    /* Build EA: the mirror of DW/DZ — the 029190 extent
+     * [029190,029678) is REMOVED from the late set (029190 runs
+     * native ALONE) and 014E5C is capsuled again. DZ sailed with
+     * 014E5C native + 029190 capsuled, convicting 029190 by
+     * elimination; EA is the direct confirmation: if the fade
+     * death RETURNS, 029190 is convicted outright. */
+    /* Build EC: the death RETURNED in EA (tick 12603, inside the
+     * skip step) and again in EB (tick 26209, dose aboard) —
+     * conviction confirmed twice. The late set is UNCHANGED in EC;
+     * 029190 is instead capsuled permanently via s_table_mask
+     * (see the EC note there). */
+    { 0x017996u, 0x017A6Au },
+    { 0x017A6Au, 0x017B04u },
+    { 0x029678u, 0x0297F8u },
+    { 0x03A4A8u, 0x03A4CEu },
+    { 0x03A4D2u, 0x03A4DEu },
+    { 0x03A66Au, 0x03A9DEu },
+    { 0x03AB40u, 0x03ABC2u },
+    { 0x03AFBEu, 0x03AFECu },
+    { 0x03AFECu, 0x03B068u },
+    { 0x03B068u, 0x03B1C8u },
+    { 0x03B4CAu, 0x03B54Au },
+    { 0x03B54Au, 0x03B55Eu },
+    { 0x03B55Eu, 0x03B570u },
+    /* EI OUTCOME (2026-11-10): 185CE4 also failed st=99
+     * (maskfail tick=12826, sp=00FFFFF6) — it is TAIL-entered
+     * from the 18617A frontend step (recomp_tail_call), same
+     * structural bar as 0021B6. EJ (#140) removes it too; the
+     * fade is unaffected (185CE4 was never late-called in the
+     * fade era — the convicted step runs it AS the step). The
+     * idle cycle's JSR-called members (03A4A8 et al.) capsule
+     * fine; step-entered members need logging, not capsules. */
+};
+/* Build EN: the late arm never disarmed, so after the fade the
+ * hot ten ran interpreted for the whole session — EK's race 2
+ * averaged roll 157 and EM's hit 207. EM (#143) TESTED: race 1
+ * finished, transition completed, race 2 was racing when Lola
+ * closed it (her breadcrumbs-only convention) — the 014434
+ * children set stands implicated for class 2. EN keeps EM's
+ * config and releases the late set's hot ten (the contiguous
+ * 03A4A8..03B570 block above) back to native once racing resumes
+ * (g_late_released, set by the trigger in main.c after 300 steps
+ * with the guest PC in [014000,015000)). The fade-step set and
+ * the frontend members {0022E2, 017A6A} stay capsuled post-arm,
+ * so the class-3 transition coverage is unchanged; race 2 runs
+ * under race 1's conditions (children capsuled, hot ten native). */
+uint32_t g_late_released = 0;
+static int rr3_late_masked(uint32_t addr) {
+    if (g_late_released && addr >= 0x03A4A8u && addr < 0x03B570u)
+        return 0;
+    for (unsigned i = 0; i < sizeof(s_late_mask) / sizeof(s_late_mask[0]); i++)
+        if (addr >= s_late_mask[i].lo && addr < s_late_mask[i].hi)
+            return 1;
+    return 0;
+}
+
 static int rr3_table_masked(uint32_t addr) {
+    if (g_late_armed && rr3_late_masked(addr))
+        return 1;
     int lo = 0, hi = (int)(sizeof(s_table_mask) / sizeof(s_table_mask[0]));
     while (lo < hi) {
         int mid = lo + (hi - lo) / 2;
@@ -204,12 +426,22 @@ static int rr3_mask_run(uint32_t addr) {
      * unbuilt — where the game trips next, if anywhere, is the
      * information this build buys. */
     if (addr == 0x01A718u) {
-        uint32_t r = glue_peek32(g_cpu.A[7]) & 0xFFFFFFu;
-        g_mask_skip_addr = addr;
-        g_mask_skip_count++;
-        g_cpu.A[7] += 4;
-        g_cpu.PC = (r && !(r & 1u)) ? r : 0x1860C8u;
-        return 1;
+        /* Build FJ: the DR bare-return skip is REMOVED — the builder
+         * runs capsuled through the normal path below. The FI watch
+         * build proved the race-side time stamps exist (func_01E0AC
+         * writes record +98 during the race) while the results
+         * buffer stayed zeroed: the skip WAS the standings bug.
+         * Keep the late-set arm exactly as DR/DV had it — the
+         * post-race protections key off g_late_armed. If the
+         * capsule fails, the generalized DQ machinery below
+         * bare-returns and freezes with the record. */
+        g_late_armed = 1;
+    }
+    /* Build DV: count late-set capsule runs (plain stores; the
+     * front-end polls and prints, see main.c). */
+    if (g_late_armed && rr3_late_masked(addr)) {
+        g_late_count++;
+        g_late_last_addr = addr;
     }
     uint32_t expected_ret = glue_peek32(g_cpu.A[7]) & 0xFFFFFFu;
     if (!expected_ret || (expected_ret & 1u)) {

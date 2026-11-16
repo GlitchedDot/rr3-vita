@@ -12,7 +12,19 @@ set(ENGINE "$ENV{HOME}/workspace/rr3-runner-work/engine-defer")
 #   RR3_NOINT    -> H-int delivery disabled (build I)
 # Bisect option (build AE): first-tick ladder markers around the fiber
 # switch and inside the interpreter drive loop (patched copy of glue.c).
-if(RR3_GSTAGES)
+if(RR3_FQ_GLUE)
+  set(GLUE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/glue_fq.c)
+elseif(RR3_FP_GLUE)
+  set(GLUE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/glue_fp.c)
+elseif(RR3_FO_GLUE)
+  set(GLUE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/glue_fo.c)
+elseif(RR3_FN_GLUE)
+  set(GLUE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/glue_fn.c)
+elseif(RR3_WATCH)
+  set(GLUE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/glue_fi.c)
+elseif(RR3_EB_GLUE)
+  set(GLUE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/glue_eb.c)
+elseif(RR3_GSTAGES)
   set(GLUE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/glue_stages.c)
 elseif(RR3_THROTTLE)
   set(GLUE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/glue_throttle.c)
@@ -31,7 +43,17 @@ else()
 endif()
 
 
-add_compile_definitions(VITA GENESIS_BATCHED_PLANES=0)
+# Perf option (build FA): batched VDP plane renderer (span fetch + LUT
+# composite) instead of the scalar per-pixel path. The engine carries both;
+# the define is honoured only by genesis_vdp.c.
+if(RR3_WATCH)
+  add_compile_definitions(RR3_WATCH_BUILD=1)
+endif()
+if(RR3_BATCHED)
+  add_compile_definitions(VITA GENESIS_BATCHED_PLANES=1)
+else()
+  add_compile_definitions(VITA GENESIS_BATCHED_PLANES=0)
+endif()
 add_compile_options(-O2 -fno-strict-aliasing)
 
 # Bisect option (build O): force signed plain char. ARM EABI defaults to
@@ -179,7 +201,23 @@ endif()
 # genesis_machine.c with step_z80 short-circuited).
 # Bisect option (build AD): first-tick markers inside machine_run_frame
 # (patched copy of genesis_machine.c with per-stage/per-line notes).
-if(RR3_NOZ80)
+# Perf option (build EY): prof4 in-step phase timers (patched copy of
+# genesis_machine.c, timers only).
+# Perf option (build FB): palette cache pre-swapped into display order
+# (patched copy of genesis_machine.c, colour_cb stores only).
+if(RR3_PROF7)
+  set(MACHINE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_machine_prof7.c)
+elseif(RR3_PROF6)
+  set(MACHINE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_machine_prof6.c)
+elseif(RR3_PROF4)
+  set(MACHINE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_machine_prof4.c)
+elseif(RR3_ARGB)
+  set(MACHINE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_machine_argb.c)
+elseif(RR3_FETCH)
+  set(MACHINE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_machine_fetch.c)
+elseif(RR3_PRESWAP)
+  set(MACHINE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_machine_preswap.c)
+elseif(RR3_NOZ80)
   set(MACHINE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_machine_noz80.c)
 elseif(RR3_MSTAGES)
   set(MACHINE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_machine_stages.c)
@@ -190,7 +228,21 @@ endif()
 # Bisect option (build Z): VDP DMA never transfers (patched copy of
 # genesis_vdp.c with all three DMA flavors stubbed at maybe_start_dma;
 # busy flags still cycle synchronously, so game polls behave).
-if(RR3_NODMA)
+if(RR3_TAB8)
+  set(VDP_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_vdp_tab8.c)
+elseif(RR3_PROF8)
+  set(VDP_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_vdp_prof8.c)
+elseif(RR3_ARGB)
+  set(VDP_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_vdp_argb.c)
+elseif(RR3_FUSED)
+  set(VDP_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_vdp_fused.c)
+elseif(RR3_SPAN)
+  set(VDP_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_vdp_span.c)
+elseif(RR3_FETCH)
+  set(VDP_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_vdp_fetch.c)
+elseif(RR3_SPR)
+  set(VDP_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_vdp_spr.c)
+elseif(RR3_NODMA)
   set(VDP_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/genesis_vdp_nodma.c)
 else()
   set(VDP_SRC ${ENGINE}/runner/video/genesis_vdp.c)
@@ -206,6 +258,8 @@ endif()
 # copy of sim_step.c with a breadcrumb between every stage).
 if(RR3_STAGES)
   set(SIMSTEP_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/sim_step_stages.c)
+elseif(RR3_PROF5)
+  set(SIMSTEP_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/sim_step_prof5.c)
 elseif(RR3_NOAUDIO)
   set(SIMSTEP_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/sim_step_noaudio.c)
 else()
@@ -290,6 +344,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 target_link_libraries(${PROJECT_NAME}
   SceCtrl_stub
   SceDisplay_stub
+  SceAudio_stub
   SceSysmodule_stub
   SceLibKernel_stub
   SceAppMgr_stub

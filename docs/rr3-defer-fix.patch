@@ -1,0 +1,144 @@
+--- a/runner/glue.c
++++ b/runner/glue.c
+@@ -441,6 +441,60 @@
+ /* Re-entrancy guard (used by glue_check_vblank, must be in global scope) */
+ static int s_in_vblank_service = 0;
+ 
++/* [DEFER-VDP] Deferred VDP-write visibility for atomic H-int service.
++ * The raster-split handler this exists for (RR3's HBlank engine) waits
++ * on the HV counter for its target line and only THEN uploads: on
++ * hardware the upload lands at the target line and affects rendering
++ * from that line on. Atomic delivery runs the whole handler at the
++ * delivery line, so an immediate write lands at the delivery line
++ * instead — every split point sits displaced by its wait length and
++ * the seam wobbles as the waits vary (the horizon band).
++ * While the level-4 branch services a handler (s_hint_service), VDP
++ * port writes ($C00000-$C00007: data + control) are queued with a
++ * stamp = the fake-raster line at write time (fix #2's phase machine
++ * has advanced vdp.scanline to exactly the line the handler waited
++ * for). machine_run_frame flushes the queue in FIFO order just
++ * before a line renders, applying every write stamped at or before
++ * that line, and flushes the remainder at frame end — so end-of-frame
++ * VDP state is unchanged and only the intra-frame visibility moves.
++ * Replays go through gbus_write16/8, so control-port command
++ * assembly, address auto-increment and DMA triggers all execute at
++ * apply time in the original order. Reads are never deferred. */
++static int s_hint_service = 0;
++typedef struct { uint32_t addr; uint16_t val; uint16_t stamp; uint8_t is8; } DVDPWrite;
++static DVDPWrite s_dvdp[8192];
++static int s_dvdp_count = 0;
++static unsigned long s_dvdp_overflow = 0;
++
++static int dvdp_try_queue(uint32_t addr, uint16_t val, int is8)
++{
++    if (!s_hint_service) return 0;
++    if (addr < 0xC00000u || addr >= 0xC00008u) return 0;
++    if (s_dvdp_count >= (int)(sizeof s_dvdp / sizeof s_dvdp[0])) { s_dvdp_overflow++; return 0; }
++    s_dvdp[s_dvdp_count].addr  = addr;
++    s_dvdp[s_dvdp_count].val   = val;
++    s_dvdp[s_dvdp_count].stamp = (uint16_t)g_machine.vdp.scanline;
++    s_dvdp[s_dvdp_count].is8   = (uint8_t)is8;
++    s_dvdp_count++;
++    return 1;
++}
++
++void glue_deferred_vdp_flush(int upto_line)
++{
++    int n = 0;
++    while (n < s_dvdp_count && (int)s_dvdp[n].stamp <= upto_line) {
++        if (s_dvdp[n].is8) gbus_write8(&g_machine.bus, s_dvdp[n].addr, (uint8_t)s_dvdp[n].val);
++        else               gbus_write16(&g_machine.bus, s_dvdp[n].addr, s_dvdp[n].val);
++        n++;
++    }
++    if (n) {
++        s_dvdp_count -= n;
++        memmove(s_dvdp, s_dvdp + n, (size_t)s_dvdp_count * sizeof s_dvdp[0]);
++    }
++}
++
++void glue_deferred_vdp_flush_all(void) { glue_deferred_vdp_flush(0x3FFFFFFF); }
++
+ #include "game_spec.h"      /* g_game_spec.call_entry_point / vblank / hblank / periodic */
+ 
+ 
+@@ -1007,6 +1061,7 @@
+         for (int i = 0; i < 256; i++) save[i] = g_ram[(byteoff + i) & 0xFFFFu];
+         g_cpu.A[7] = STK;
+         s_in_vblank_service = 1;
++        s_hint_service = 1;   /* [DEFER-VDP] queue this handler's VDP writes */
+         /* Same audio-stamp re-base as own_deliver_vint: H-int handler chip
+          * writes stamp at the delivery raster, not the parked counter. */
+         uint32_t saved_rebase = g_68k_stamp_rebase;
+@@ -1025,6 +1080,7 @@
+         g_rte_pending_ptr = &s_rte_real; g_rte_pending = 0;
+         g_68k_stamp_rebase = saved_rebase;
+         s_in_vblank_service = 0;
++        s_hint_service = 0;   /* [DEFER-VDP] */
+         for (int i = 0; i < 256; i++) g_ram[(byteoff + i) & 0xFFFFu] = save[i];
+         g_cpu = saved;
+         recomp_interrupt_context_leave(saved_split_sp_popped);
+@@ -1742,7 +1798,8 @@
+         g_mem_write_trace_fn(byte_addr,      (uint8_t)(val >> 8), g_audio_cycle_counter);
+         g_mem_write_trace_fn(byte_addr + 1u, (uint8_t)val,        g_audio_cycle_counter);
+     }
+-    gbus_write16(&g_machine.bus, byte_addr, val);
++    if (!dvdp_try_queue(byte_addr, val, 0))
++        gbus_write16(&g_machine.bus, byte_addr, val);
+     /* [Z80-SERVICE] Atomic interrupt service (s_in_vblank_service) runs the
+      * handler with every fiber yield gated and the scanline scheduler
+      * frozen, so the Z80 cannot advance at all while the handler runs.
+@@ -1776,7 +1833,8 @@
+     HYBRID_BUMP_CYCLES();
+     if (g_mem_write_trace_fn)
+         g_mem_write_trace_fn(byte_addr, val, g_audio_cycle_counter);
+-    gbus_write8(&g_machine.bus, byte_addr, val);
++    if (!dvdp_try_queue(byte_addr, val, 1))
++        gbus_write8(&g_machine.bus, byte_addr, val);
+ }
+ 
+ void m68k_write32(uint32_t byte_addr, uint32_t val)
+@@ -1800,8 +1858,13 @@
+         g_mem_write_trace_fn(byte_addr + 2u, (uint8_t)(val >> 8),  g_audio_cycle_counter);
+         g_mem_write_trace_fn(byte_addr + 3u, (uint8_t)val,         g_audio_cycle_counter);
+     }
+-    gbus_write16(&g_machine.bus, byte_addr,     (uint16_t)(val >> 16));
+-    gbus_write16(&g_machine.bus, byte_addr + 2, (uint16_t)(val & 0xFFFF));
++    if (dvdp_try_queue(byte_addr, (uint16_t)(val >> 16), 0)) {
++        if (!dvdp_try_queue(byte_addr + 2, (uint16_t)(val & 0xFFFF), 0))
++            gbus_write16(&g_machine.bus, byte_addr + 2, (uint16_t)(val & 0xFFFF));
++    } else {
++        gbus_write16(&g_machine.bus, byte_addr,     (uint16_t)(val >> 16));
++        gbus_write16(&g_machine.bus, byte_addr + 2, (uint16_t)(val & 0xFFFF));
++    }
+ }
+ 
+ /* Scheduler rule: busy-wait detectors restart at every wall-frame boundary.
+--- a/runner/video/genesis_machine.c
++++ b/runner/video/genesis_machine.c
+@@ -149,6 +149,8 @@
+ extern void glue_run_game_chunk(uint32_t cycles);
+ extern void glue_own_interrupt(int level, GVDP *vdp);
+ extern int  glue_own_vint_service_latched(GVDP *vdp);  /* deliver a V-int latched while 68K IRQs were masked */
++extern void glue_deferred_vdp_flush(int upto_line);    /* [DEFER-VDP] apply queued H-int VDP writes up to a line */
++extern void glue_deferred_vdp_flush_all(void);         /* [DEFER-VDP] drain the queue (frame end) */
+ 
+ /* ARGB palette cache: CRAM normal/shadow/highlight, the black-bar sentinel,
+  * then optional host-owned colors. Only the first 192 entries come from
+@@ -569,6 +571,10 @@
+             glue_own_interrupt(6, &m->vdp);
+         }
+ 
++        /* [DEFER-VDP] Apply H-int-service VDP writes whose wait-target
++         * line has arrived, before this line renders with them. */
++        glue_deferred_vdp_flush(line);
++
+         /* Render + emit active scanlines. In interlace mode 2 each raster
+          * line yields TWO output rows (the even and odd fields' lines,
+          * rendered progressively into a 448-row frame). */
+@@ -596,5 +602,6 @@
+ 
+         m->master_cycle += MASTER_PER_LINE;
+     }
++    glue_deferred_vdp_flush_all();   /* [DEFER-VDP] nothing carries across frames */
+     g_snd_frame++;   /* [SND-TRACE] */
+ }

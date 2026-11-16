@@ -1,0 +1,60 @@
+diff -ruN a/runner/glue.c b/runner/glue.c
+--- a/runner/glue.c	2026-10-16 04:23:52.700426409 +0000
++++ b/runner/glue.c	2026-10-16 04:23:58.446426632 +0000
+@@ -1720,6 +1720,21 @@
+         g_mem_write_trace_fn(byte_addr + 1u, (uint8_t)val,        g_audio_cycle_counter);
+     }
+     gbus_write16(&g_machine.bus, byte_addr, val);
++    /* [Z80-SERVICE] Atomic interrupt service (s_in_vblank_service) runs the
++     * handler with every fiber yield gated and the scanline scheduler
++     * frozen, so the Z80 cannot advance at all while the handler runs.
++     * A handler that releases the Z80 bus and then spins on a Z80
++     * handshake byte — RR3's VBlank sound tick enqueueing a command while
++     * the driver is mid-consume (Z80 RAM +0x0B busy flag) — deadlocks:
++     * the flag can only clear if the Z80 executes, and it never does.
++     * On hardware the Z80 runs concurrently with the handler. Mirror
++     * that here: each bus-request RELEASE inside atomic service steps
++     * the Z80 one scanline slice (step_z80 self-gates while the bus is
++     * requested or reset is held, so this only ever gives the Z80 the
++     * cycles hardware would have given it). Outside atomic service the
++     * scheduler already paces the Z80; do not double-step there. */
++    if (s_in_vblank_service && byte_addr == 0xA11100u && !(val & 0x100u))
++        machine_step_z80_scanline();
+ }
+ 
+ void m68k_write8(uint32_t byte_addr, uint8_t val)
+diff -ruN a/runner/video/genesis_machine.c b/runner/video/genesis_machine.c
+--- a/runner/video/genesis_machine.c	2026-10-16 04:23:52.706426409 +0000
++++ b/runner/video/genesis_machine.c	2026-10-16 04:23:58.470426633 +0000
+@@ -466,6 +466,21 @@
+ #endif
+ }
+ 
++/* Advance the Z80 by one scanline slice OUTSIDE the raster loop. For the
++ * atomic interrupt-delivery path (glue.c own_deliver_vint / own_deliver_hint):
++ * while a handler runs atomically the scanline scheduler is frozen, so a
++ * handler that releases the Z80 bus and then polls a Z80 handshake byte
++ * (RR3's sound-command enqueue spinning on driver RAM +0x0B) can never see
++ * the byte change — on hardware the Z80 executes concurrently and clears
++ * the flag within ~100 cycles. glue.c calls this on each bus-request
++ * release write inside atomic handler service so the Z80 makes the same
++ * progress it would on hardware while the 68K waits. step_z80 self-gates
++ * on busreq/reset, so calls made while the Z80 is halted are no-ops. */
++void machine_step_z80_scanline(void)
++{
++    step_z80(&g_machine, Z80_PER_LINE);
++}
++
+ void machine_run_frame(GenesisScanlineSink sink, void *user)
+ {
+     GenesisMachine *m = &g_machine;
+diff -ruN a/runner/video/genesis_machine.h b/runner/video/genesis_machine.h
+--- a/runner/video/genesis_machine.h	2026-10-16 04:23:52.710859844 +0000
++++ b/runner/video/genesis_machine.h	2026-10-16 04:23:58.463426632 +0000
+@@ -55,5 +55,6 @@
+ /* Run one full frame: per scanline, advance the 68K (fiber), step the Z80, tick
+  * the VDP, deliver interrupts, and emit active scanlines via `sink`. */
+ void machine_run_frame(GenesisScanlineSink sink, void *user);
++void machine_step_z80_scanline(void);   /* one Z80 scanline slice, out-of-raster (atomic IRQ service) */
+ 
+ #endif /* GENESIS_MACHINE_H */

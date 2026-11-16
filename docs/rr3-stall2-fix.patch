@@ -1,0 +1,93 @@
+diff -ruN a/runner/glue.c b/runner/glue.c
+--- a/runner/glue.c	2026-10-16 04:24:09.483715940 +0000
++++ b/runner/glue.c	2026-10-16 05:23:18.364564793 +0000
+@@ -1615,7 +1615,26 @@
+     bus_ring_push(byte_addr, 1);
+     spin_check(byte_addr, 0);
+     HYBRID_BUMP_CYCLES();
+-    return gbus_read16(&g_machine.bus, byte_addr);
++    uint16_t result = gbus_read16(&g_machine.bus, byte_addr);
++    /* [RASTER-SERVICE] Atomic interrupt service (s_in_vblank_service) runs
++     * the handler with every fiber yield gated and the scanline scheduler
++     * frozen, so the VDP raster cannot advance while the handler runs —
++     * the HV counter is computed from the scheduler's scanline state. A
++     * handler that polls the HV counter waiting for the beam to reach a
++     * target line/position — RR3's HBlank raster-split upload (wait for
++     * line, wait for hblank, wait for exact HV word) — deadlocks: the
++     * counter can only move if the scheduler runs, and it never does. On
++     * hardware the beam sweeps concurrently with the handler and the wait
++     * resolves within a few lines.
++     * Mirror that here: each HV-counter read
++     * inside atomic service advances the raster one observable phase
++     * (active -> hblank -> next line) after the read samples the current
++     * position, so a poll loop sees the same forward progress hardware
++     * gives it. Outside atomic service the scheduler paces the raster;
++     * do not double-advance there. */
++    if (s_in_vblank_service && byte_addr >= 0xC00008u && byte_addr <= 0xC0000Fu)
++        machine_advance_raster_phase();
++    return result;
+ }
+ 
+ /* IO port access logging for joypad debugging */
+@@ -1687,6 +1706,10 @@
+             s_io_log_count++;
+         }
+     }
++    /* [RASTER-SERVICE] Byte-wide HV-counter polls ($C00009 = H byte) get
++     * the same raster advance as word polls — see m68k_read16. */
++    if (s_in_vblank_service && byte_addr >= 0xC00008u && byte_addr <= 0xC0000Fu)
++        machine_advance_raster_phase();
+     return result;
+ }
+ 
+diff -ruN a/runner/video/genesis_machine.c b/runner/video/genesis_machine.c
+--- a/runner/video/genesis_machine.c	2026-10-16 04:24:09.484427060 +0000
++++ b/runner/video/genesis_machine.c	2026-10-16 05:23:18.371564794 +0000
+@@ -481,6 +481,37 @@
+     step_z80(&g_machine, Z80_PER_LINE);
+ }
+ 
++/* Advance the VDP raster position by one observable phase OUTSIDE the
++ * raster loop: active-display -> hblank on the same line, then hblank ->
++ * active on the next line. For the atomic interrupt-delivery path: while a
++ * handler runs atomically the scanline scheduler is frozen, so the HV
++ * counter (gvdp_read_hv_counter derives it from scanline/in_hblank) is
++ * frozen too — a handler that spins on the HV counter waiting for the beam
++ * to reach a target line/position (RR3's HBlank raster-split upload:
++ * wait-for-line, wait-for-hblank, wait-for-exact-HV) can never see it move.
++ * On hardware the beam keeps sweeping while the handler polls, and the
++ * wait resolves within a few lines. glue.c calls this after each HV-counter
++ * read inside atomic handler service so each poll sees the beam one phase
++ * further on — the same progress hardware gives it. ONLY the two fields
++ * the HV counter is computed from are touched: no IRQ bookkeeping
++ * (hint_counter/vint_pending live in gvdp_begin_scanline, which the
++ * scheduler calls with its own line counter next iteration and re-syncs
++ * scanline), no rendering state (gvdp_render_scanline takes its line as a
++ * parameter). Advancing stops at the last raster line rather than
++ * wrapping into the next frame: an in-frame target always resolves, and a
++ * target that never comes keeps the watchdog as the backstop, exactly as
++ * before. */
++void machine_advance_raster_phase(void)
++{
++    GVDP *v = &g_machine.vdp;
++    if (!v->in_hblank) {
++        v->in_hblank = 1;
++    } else if (v->scanline < LINES_TOTAL - 1) {
++        v->in_hblank = 0;
++        v->scanline++;
++    }
++}
++
+ void machine_run_frame(GenesisScanlineSink sink, void *user)
+ {
+     GenesisMachine *m = &g_machine;
+diff -ruN a/runner/video/genesis_machine.h b/runner/video/genesis_machine.h
+--- a/runner/video/genesis_machine.h	2026-10-16 04:24:09.485743562 +0000
++++ b/runner/video/genesis_machine.h	2026-10-16 05:16:35.597549162 +0000
+@@ -56,5 +56,6 @@
+  * the VDP, deliver interrupts, and emit active scanlines via `sink`. */
+ void machine_run_frame(GenesisScanlineSink sink, void *user);
+ void machine_step_z80_scanline(void);   /* one Z80 scanline slice, out-of-raster (atomic IRQ service) */
++void machine_advance_raster_phase(void); /* one HV-counter phase, out-of-raster (atomic IRQ service) */
+ 
+ #endif /* GENESIS_MACHINE_H */

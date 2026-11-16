@@ -15,6 +15,7 @@
  *   phase 3: interactive loop, vblank-paced, sceCtrl -> Genesis pads.
  * Audio chips are drained into scratch buffers (advanced, not played).
  */
+#include <psp2/audioout.h>
 #include <psp2/ctrl.h>
 #include <psp2/display.h>
 #include <psp2/io/fcntl.h>
@@ -47,13 +48,10 @@ static void sink_row(void *user, int line, const uint32_t *argb, int width)
     (void)user;
     if (line < 0 || line >= FB_H) return;
     if (width > FB_W) width = FB_W;
-    /* Machine hands us 0xAARRGGBB words; the display buffer format
-     * (A8B8G8R8) wants R in the low byte -> swap R and B. */
-    uint32_t *dst = s_fb[line];
-    for (int x = 0; x < width; x++) {
-        uint32_t v = argb[x];
-        dst[x] = (v & 0xFF00FF00u) | ((v >> 16) & 0xFFu) | ((v & 0xFFu) << 16);
-    }
+    /* Build FB: the machine's palette cache is pre-swapped into display
+     * order (A8B8G8R8) by genesis_machine_preswap.c, so the row arrives
+     * ready to store — a plain copy replaces the per-pixel R/B swap. */
+    memcpy(s_fb[line], argb, (size_t)width * sizeof(uint32_t));
 }
 
 static int16_t s_fm[4096 * 2];
@@ -61,7 +59,317 @@ static int16_t s_psg[16384];
 static size_t  s_fm_count, s_psg_count;
 
 static GenesisSimAudio s_audio = { s_fm, 4096, &s_fm_count, s_psg, 16384, &s_psg_count };
-static GenesisSimHooks s_hooks = { NULL, sink_row, NULL, NULL, NULL };
+
+/* Build GR (Phase 2, Stage A): Vita audio output stage. The sim has
+ * always rendered FM (ymfm YM2612) and PSG (SN76489) into s_fm/s_psg
+ * on every step - the counts land in s_fm_count/s_psg_count - and
+ * until now nothing consumed them. This stage mixes them at the
+ * reference levels (FM /1, PSG /8, the clownmdemu divisors the host
+ * audio.c uses), resamples to 48 kHz stereo, and feeds sceAudioOut
+ * from a dedicated thread through a lock-free ring, so the sim thread
+ * never touches the audio device.
+ *
+ * Rate strategy (RR3_AUDIO_FOLLOW=1): each step produces exactly
+ * 1/60 s of game audio, but the wall period between steps is ~50-75
+ * ms at the banked frame rate. Follow mode stretches each frame's
+ * audio across the measured (EMA) wall period, so playback is
+ * continuous and synced to the game - pitch rides with game speed.
+ * FOLLOW=0 produces the true 800 samples/frame and the ring simply
+ * underruns (bursts at true pitch) - kept as an A/B switch.
+ * Build GV: the A/B is taken - FOLLOW=0. GU proved the follow-mode
+ * transport sample-perfect (audcap == audcap2 byte-identical) and
+ * sailed, but Lola's ears still called the 3-4x interpolation
+ * stretch 'trying'; GV plays each step's audio at true pitch in
+ * bursts (800 frames/step against a 1024-frame grain, so the GU
+ * wait policy idles between pushes) so she can judge the other
+ * strategy directly. Everything else is GU unchanged.
+ * Counters ride the maskstat cadence on their own audstat line; the
+ * audio-on line prints once when the port opens at phase-3 entry. */
+#define RR3_AUDIO_RATE   48000
+#define RR3_AUDIO_GRAIN  1024
+#define RR3_AUDIO_RING   32768u
+#define RR3_AUDIO_FOLLOW 0
+static int16_t s_aud_ring[RR3_AUDIO_RING * 2];
+static volatile uint32_t s_aud_head = 0;      /* producer frame index */
+static volatile uint32_t s_aud_tail = 0;      /* consumer frame index */
+static volatile uint32_t s_aud_underruns = 0; /* silence grains fed   */
+static volatile uint32_t s_aud_overruns = 0;  /* pushes dropped full  */
+static uint32_t s_aud_produced = 0;           /* frames pushed total  */
+static int s_aud_port = -1;
+static uint64_t s_aud_last_push_us = 0;
+static double s_aud_period_ms = 0.0;
+/* Build GS: one-shot capture of the first RR3_AUDCAP_FRAMES mixed
+ * frames (the title-screen music heard first), written once to
+ * ux0:/data/rr3vita/audcap.raw from the poll phase so the exact
+ * stream that reached the speakers can be waveform-checked
+ * off-device. GR's audstat acquitted the transport (und=19 total,
+ * ovr=0, fm/psg counts exact) while Lola heard mostly crackle -
+ * the fault is in the content or the resample, and this capture
+ * separates the two. */
+#define RR3_AUDCAP_FRAMES 96000u
+static int16_t s_audcap[RR3_AUDCAP_FRAMES * 2];
+static uint32_t s_audcap_n = 0;
+static int s_audcap_pending = 0;
+/* Build GT: ring-exit capture - the audio thread copies every
+ * grain it is about to hand sceAudioOutOutput into this second
+ * capture. GS's entry capture proved the mix itself is clean
+ * (peak 5634, no clipping, no discontinuities, no grain seams)
+ * while Lola still heard crackle, so the corruption sits between
+ * the ring write and the speakers; diffing audcap2 against
+ * audcap shows whether the ring/thread path alters the samples
+ * or the fault is inside the sceAudioOut handoff itself. */
+#define RR3_AUDCAP2_FRAMES 96000u
+static int16_t s_audcap2[RR3_AUDCAP2_FRAMES * 2];
+static uint32_t s_audcap2_n = 0;
+static volatile int s_audcap2_pending = 0;
+
+static int rr3_audio_thread(SceSize args, void *argp)
+{
+    (void)args; (void)argp;
+    /* Build GT: ping-pong handoff buffers (kept). GR/GS used ONE
+     * blk reused every grain; two buffers alternate so a fill
+     * never touches the buffer most recently handed over.
+     * Build GU: WAIT for a full grain instead of punching silence.
+     * GT's audcap2 reconstruction was decisive: delete four zero
+     * runs (4096 startup + 2048 + 1024 + 768 mid-stream) from the
+     * exit capture and the remaining 88,064 frames are SAMPLE-
+     * IDENTICAL to the entry capture - the ring, thread and
+     * handoff deliver perfect bytes; the ONLY corruption was the
+     * all-or-nothing policy below, which output a full silence
+     * grain whenever the thread woke to a ring trough (producer
+     * and consumer rates match only on average in follow mode).
+     * Those punched-in holes ARE the crackle. Now: sleep 2 ms
+     * and re-check; output nothing until a full grain exists.
+     * s_aud_underruns counts trough EPISODES (entries into the
+     * wait), not grains. */
+    static int16_t blk[2][RR3_AUDIO_GRAIN * 2];
+    int which = 0;
+    int waited = 0;
+    for (;;) {
+        uint32_t avail = s_aud_head - s_aud_tail;
+        if (avail < (uint32_t)RR3_AUDIO_GRAIN) {
+            if (!waited) { s_aud_underruns++; waited = 1; }
+            sceKernelDelayThread(2000);
+            continue;
+        }
+        waited = 0;
+        int16_t *cur = blk[which];
+        which ^= 1;
+        {
+            uint32_t base = s_aud_tail;
+            for (int i = 0; i < RR3_AUDIO_GRAIN; i++) {
+                uint32_t slot = (base + (uint32_t)i) & (RR3_AUDIO_RING - 1u);
+                cur[i * 2]     = s_aud_ring[slot * 2];
+                cur[i * 2 + 1] = s_aud_ring[slot * 2 + 1];
+            }
+            s_aud_tail = base + (uint32_t)RR3_AUDIO_GRAIN;
+        }
+        if (s_audcap2_n < RR3_AUDCAP2_FRAMES) {
+            uint32_t room = RR3_AUDCAP2_FRAMES - s_audcap2_n;
+            uint32_t c = room < RR3_AUDIO_GRAIN ? room
+                                                : RR3_AUDIO_GRAIN;
+            memcpy(&s_audcap2[s_audcap2_n * 2], cur,
+                   c * 2u * sizeof(int16_t));
+            s_audcap2_n += c;
+            if (s_audcap2_n >= RR3_AUDCAP2_FRAMES)
+                s_audcap2_pending = 1;
+        }
+        sceAudioOutOutput(s_aud_port, cur);
+    }
+    return 0;
+}
+
+static void rr3_audio_start(void)
+{
+    s_aud_port = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_MAIN,
+                                     RR3_AUDIO_GRAIN, RR3_AUDIO_RATE,
+                                     SCE_AUDIO_OUT_MODE_STEREO);
+    { FILE *af = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+      if (af) { fprintf(af, "audio-on port=%d rate=%d grain=%d follow=%d\n",
+                        s_aud_port, RR3_AUDIO_RATE, RR3_AUDIO_GRAIN,
+                        RR3_AUDIO_FOLLOW);
+                fclose(af); } }
+    if (s_aud_port < 0) return;
+    { int vol[2] = { SCE_AUDIO_OUT_MAX_VOL, SCE_AUDIO_OUT_MAX_VOL };
+      sceAudioOutSetVolume(s_aud_port,
+                           (SceAudioOutChannelFlag)(SCE_AUDIO_VOLUME_FLAG_L_CH |
+                                                    SCE_AUDIO_VOLUME_FLAG_R_CH),
+                           vol); }
+    { SceUID th = sceKernelCreateThread("rr3_audio", rr3_audio_thread,
+                                        0x10000100, 0x40000, 0, 0, NULL);
+      if (th >= 0) sceKernelStartThread(th, 0, NULL); }
+    s_aud_last_push_us = sceKernelGetProcessTimeWide();
+}
+
+static void rr3_audio_push(void)
+{
+    size_t fm_n = s_fm_count, psg_n = s_psg_count;
+    if (s_aud_port < 0 || (fm_n == 0 && psg_n == 0)) return;
+    uint64_t now = sceKernelGetProcessTimeWide();
+    uint32_t out_n = RR3_AUDIO_RATE / 60u;
+#if RR3_AUDIO_FOLLOW
+    if (s_aud_last_push_us) {
+        double dt_ms = (double)(now - s_aud_last_push_us) / 1000.0;
+        if (dt_ms < 5.0) dt_ms = 5.0;
+        if (dt_ms > 250.0) dt_ms = 250.0;
+        s_aud_period_ms = s_aud_period_ms > 0.0
+                        ? s_aud_period_ms * 0.8 + dt_ms * 0.2 : dt_ms;
+        out_n = (uint32_t)(RR3_AUDIO_RATE * s_aud_period_ms / 1000.0 + 0.5);
+    }
+#endif
+    s_aud_last_push_us = now;
+    if (out_n < 64u) out_n = 64u;
+    if (out_n > 8192u) out_n = 8192u;
+    if ((s_aud_head - s_aud_tail) + out_n > RR3_AUDIO_RING) {
+        s_aud_overruns++;
+        return;
+    }
+    { uint32_t base = s_aud_head;
+      /* Build GS: linear interpolation replaces GR's nearest-
+       * neighbour reads (the 4.1x stretch aliases both chips, the
+       * PSG worst). A 16.16 fixed-point cursor walks the PSG
+       * timeline; the FM position follows it proportionally. */
+      uint32_t step_fp = (uint32_t)(((uint64_t)psg_n << 16) / out_n);
+      uint32_t pos_fp = 0;
+      for (uint32_t i = 0; i < out_n; i++) {
+          size_t si = pos_fp >> 16;
+          uint32_t frac = pos_fp & 0xFFFFu;
+          int32_t p = 0;
+          if (psg_n) {
+              size_t sj = si + 1 < psg_n ? si + 1 : si;
+              int32_t a = s_psg[si], b = s_psg[sj];
+              p = (a + (int32_t)(((b - a) * (int32_t)frac) >> 16)) / 8;
+          }
+          int32_t l = p, r = p;
+          if (fm_n) {
+              uint64_t ffp = psg_n ? (uint64_t)pos_fp * fm_n / psg_n
+                                   : ((uint64_t)i * fm_n << 16) / out_n;
+              size_t fi = (size_t)(ffp >> 16);
+              uint32_t ff = (uint32_t)(ffp & 0xFFFFu);
+              size_t fj = fi + 1 < fm_n ? fi + 1 : fi;
+              int32_t al = s_fm[fi * 2], bl = s_fm[fj * 2];
+              int32_t ar = s_fm[fi * 2 + 1], br = s_fm[fj * 2 + 1];
+              l += al + (int32_t)(((bl - al) * (int32_t)ff) >> 16);
+              r += ar + (int32_t)(((br - ar) * (int32_t)ff) >> 16);
+          }
+          pos_fp += step_fp;
+          if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
+          if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
+          { uint32_t slot = (base + i) & (RR3_AUDIO_RING - 1u);
+            s_aud_ring[slot * 2]     = (int16_t)l;
+            s_aud_ring[slot * 2 + 1] = (int16_t)r; }
+          if (s_audcap_n < RR3_AUDCAP_FRAMES) {
+              s_audcap[s_audcap_n * 2]     = (int16_t)l;
+              s_audcap[s_audcap_n * 2 + 1] = (int16_t)r;
+              if (++s_audcap_n >= RR3_AUDCAP_FRAMES)
+                  s_audcap_pending = 1;
+          }
+      }
+      s_aud_head = base + out_n;
+      s_aud_produced += out_n; }
+}
+
+/* Build ER (perf front, instrument only): phase timers for one sim step.
+ * genesis_sim_step's own seams split the step without touching engine
+ * code: pre_raster fires after glue_run_game_frame (the native game
+ * frame), post_drain after machine_run_frame + the audio drain. The
+ * phase-3 loop arms the timers around its step call; buckets accumulate
+ * microseconds and are printed (and reset) with the maskstat line every
+ * 1200 frames. No guest-visible state changes; the hooks were unused.
+ * Buckets: game = native game frame, mach = machine frame + drain,
+ * rest = vblank service + end-of-frame inside the step, pres =
+ * display_present. Pre-registered read: the biggest bucket names the
+ * next build's (ES) lever. */
+static uint64_t s_prof_game_us, s_prof_mach_us, s_prof_rest_us, s_prof_pres_us;
+/* Build ES: loop-split buckets. polls = the counter-poll region between
+ * the step and the call-ring block (one fopen cycle per changed counter);
+ * ring = the call-ring drain + every-frame tail snapshot (one fopen);
+ * frame = the whole main-loop iteration (accumulated roll delta), so
+ * other = frame - step - polls - ring - pres at print time. */
+static uint64_t s_prof_polls_us, s_prof_ring_us, s_prof_frame_us;
+static uint64_t s_prof_wait_us, s_prof_play_us, s_prof_top_us; /* EV prof3 */
+/* Build EZ (park-timing dig): INERT LAYOUT PROBE. This 4 KB BSS array is
+ * never read or written by any code path; its only effect is to shift the
+ * addresses of the BSS symbols that follow it (and perturb the data layout
+ * generally) relative to EX. EZ is otherwise EX byte-for-byte in behaviour:
+ * same masks, same glue, same scalar blit, same loop, no prof4. The A/B
+ * question: does an inert data-layout shift alone flip EX's sail into the
+ * 0146AE death? If yes, the "timing sensitivity" is really a latent memory
+ * bug whose detonation depends on build layout. */
+__attribute__((used)) static uint8_t s_layout_probe_ez[4096];
+/* Build FK: second inert BSS array — a layout re-roll for the
+ * un-skip build (FJ died at the 0146AE tripwire on its changed
+ * dispatch TU before the builder ever ran). */
+__attribute__((used)) static uint8_t s_layout_probe_fk[2048];
+/* Build FQ: second inert layout probe (3072 B) - the tripwire
+ * re-roll after FP drew the 0146AE death (witnessed in-step). */
+__attribute__((used)) static uint8_t s_layout_probe_fq[3072];
+/* Build GR: inert layout probe (1024 B) - the re-roll for the
+ * first audio build (new output-stage statics + thread). */
+__attribute__((used)) static uint8_t s_layout_probe_gr[1024];
+/* Build GS: inert layout probe (2560 B) - the re-roll after GR
+ * drew the 0146AE tripwire (witnessed in-step, session 40). */
+__attribute__((used)) static uint8_t s_layout_probe_gs[2560];
+/* Build GT: inert layout probe (1792 B) - the re-roll after GS
+ * drew the tripwire too (third witnessed in-step death). */
+__attribute__((used)) static uint8_t s_layout_probe_gt[1792];
+__attribute__((used)) static uint8_t s_layout_probe_gu[3328];
+__attribute__((used)) static uint8_t s_layout_probe_gv[2816];
+__attribute__((used)) static uint8_t s_layout_probe_gw[2304];
+__attribute__((used)) static uint8_t s_layout_probe_gx[3584];
+__attribute__((used)) static uint8_t s_layout_probe_gy[4096];
+__attribute__((used)) static uint8_t s_layout_probe_gz[1536];
+__attribute__((used)) static uint8_t s_layout_probe_ha[2048];
+static uint64_t s_prof_t0, s_prof_t1, s_prof_t2;
+static int s_prof_armed, s_prof_fired;
+/* Build GW (perf hunt for the 60 FPS gate): split the mach bucket
+ * at the machine_run_frame | audio_mixer_drain seam. The standing
+ * prof lines price the step at ~30 ms as game ~5.3 + mach ~24.8 +
+ * rest ~0.1 - the gate lives inside mach, but run (VDP/Z80/bus)
+ * and drain (ymfm FM + SN76489 render) need separate prices
+ * before any lever is chosen. src/sim_step_prof5.c (RR3_PROF5)
+ * is the engine sim_step.c with ONE added rr3_prof5_mark() call
+ * at that seam; prof_post_drain folds the halves into buckets.
+ * One clock read per step - the ER seam pattern, not EY's
+ * in-step instrumentation. */
+static uint64_t s_prof_run_us, s_prof_drain_us, s_prof_tm;
+void rr3_prof5_mark(void)
+{
+    if (!s_prof_armed) return;
+    s_prof_tm = sceKernelGetProcessTimeWide();
+}
+/* Build GX: prof6 support - the armed clock the fetch machine's
+ * prof6 variant reads (genesis_machine_prof6.c), armed with the
+ * ER prof timers around the phase-3 step. */
+int rr3_prof6_armed;
+uint64_t rr3_prof6_clock(void) { return sceKernelGetProcessTimeWide(); }
+extern uint64_t g_prof6_chunk_us, g_prof6_mid_us, g_prof6_rend_us;
+extern uint64_t g_prof7_scan_us, g_prof7_conv_us, g_prof7_sink_us;
+extern uint64_t g_prof8_spr_us, g_prof8_fetch_us, g_prof8_comp_us;   /* GY prof7 */
+static void prof_pre_raster(void *ctx)
+{
+    (void)ctx;
+    if (!s_prof_armed) return;
+    uint64_t t = sceKernelGetProcessTimeWide();
+    s_prof_game_us += t - s_prof_t0;
+    s_prof_t1 = t;
+    s_prof_tm = 0;
+}
+static int prof_post_drain(void *ctx)
+{
+    (void)ctx;
+    if (!s_prof_armed) return 1;
+    uint64_t t = sceKernelGetProcessTimeWide();
+    s_prof_mach_us += t - s_prof_t1;
+    if (s_prof_tm > s_prof_t1 && s_prof_tm <= t) {
+        s_prof_run_us += s_prof_tm - s_prof_t1;
+        s_prof_drain_us += t - s_prof_tm;
+    }
+    s_prof_t2 = t;
+    s_prof_fired = 1;
+    return 1;
+}
+static GenesisSimHooks s_hooks = { prof_pre_raster, sink_row, NULL, prof_post_drain, NULL };
 
 extern unsigned rr3_fiber_markers(void);
 extern int glue_interp_seen_count(void);
@@ -144,7 +452,7 @@ static int display_init(void)
 }
 
 /* ---- on-screen debug stats (Lola's request, build M onward) ----
- * Live TICK / SIM ms / ROLL ms drawn into the display buffer at
+ * Live TICK / SIM ms / frame ms drawn into the display buffer at
  * present time. The numbers mirror the breadcrumb fields so what
  * she watches on screen and what the file records stay the same. */
 static int      s_stats_on = 0;
@@ -184,7 +492,7 @@ static void draw_stats(uint32_t *dst)
     char line[64];
     snprintf(line, sizeof line, "TICK %u", s_stat_tick);
     draw_text(dst, 12, 10, line);
-    snprintf(line, sizeof line, "SIM %.2f ROLL %.2f", s_stat_sim_ms, s_stat_roll_ms);
+    snprintf(line, sizeof line, "SIM %.2f %.2f ms", s_stat_sim_ms, s_stat_roll_ms);
     draw_text(dst, 12, 28, line);
 }
 
@@ -212,8 +520,11 @@ static void draw_build_stamp(uint32_t *dst)
 /* What this build is doing, in plain words, bottom-left (Lola's
  * request, build CT onward): so a test build explains itself on
  * screen without her having to remember which letter hunts what.
- * Edit RR3_PURPOSE_TEXT per build; keep it short and simple. */
-#define RR3_PURPOSE_TEXT "DR: 01A718 NEVER EXECUTES BARE RETURN"
+ * Edit RR3_PURPOSE_TEXT per build. From EV onward a line too long
+ * for the strip scrolls right-to-left as a marquee (Lola's request,
+ * 2026-11-12, after EU's purpose text overflowed the screen);
+ * short lines stay static, and the FAIL/FROZEN alerts never scroll. */
+#define RR3_PURPOSE_TEXT "HA: TABLE-DRIVEN TILE FETCH"
 static void draw_purpose_stamp(uint32_t *dst)
 {
     const char *line = RR3_PURPOSE_TEXT;
@@ -223,6 +534,7 @@ static void draw_purpose_stamp(uint32_t *dst)
      * is visible on screen even if the process dies before the next
      * breadcrumb poll. No IO, no fiber involvement. */
     char failbuf[64];
+    int alert = 0;
     { extern uint32_t g_mask_fail_count, g_mask_fail_addr,
                       g_mask_fail_status, g_mask_fail_badpc,
                       g_mask_fail_badop, g_mask_fail_exit,
@@ -233,13 +545,56 @@ static void draw_purpose_stamp(uint32_t *dst)
                    (unsigned)g_mask_fail_addr, (unsigned)g_mask_fail_status,
                    (unsigned)g_mask_fail_badpc, (unsigned)g_mask_fail_badop,
                    (unsigned)g_mask_fail_exit, (unsigned)g_mask_fail_want);
-          line = failbuf;
+          line = failbuf; alert = 1;
       } }
+    /* Build DS: a freeze with NO capsule failure is the deliberate
+     * halt after the 01A718 skip — label it as such on screen so the
+     * frozen frame reads as the experiment working, not a crash. */
+    { extern uint32_t g_mask_freeze, g_mask_fail_count;
+      if (g_mask_freeze && !g_mask_fail_count) {
+          snprintf(failbuf, sizeof failbuf,
+                   "HA FROZEN - HALTED");
+          line = failbuf; alert = 1;
+      } }
+    /* Marquee (staged for EV; Lola 2026-11-12): a purpose line too
+     * long for the strip scrolls right-to-left — a fixed-width window
+     * over the line repeated with a 4-space gap, offset by wall time
+     * (1 char per 200 ms) so the pace is frame-rate independent.
+     * Pure present-side work: no IO, no state beyond the clock. */
+    char win[64];
+    if (!alert) {
+        int len = (int)strlen(line);
+        int maxc = (SCR_W - 24) / 18;
+        if (len > maxc) {
+            int cycle = len + 4;
+            int off = (int)((sceKernelGetProcessTimeWide() / 200000u)
+                            % (uint64_t)cycle);
+            for (int i = 0; i < maxc; i++) {
+                int p = (off + i) % cycle;
+                win[i] = (p < len) ? line[p] : ' ';
+            }
+            win[maxc] = '\0';
+            line = win;
+        }
+    }
     int w = 12 + (int)strlen(line) * 18 + 12;
     for (int y = SCR_H - 32; y < SCR_H - 6; y++)
         for (int x = 6; x < w; x++)
             dst[y * SCR_W + x] = 0xE8101010u;
     draw_text(dst, 12, SCR_H - 28, line);
+}
+
+/* Build FM: write-ahead host-phase witness for the 0146AE tripwire.
+ * One tiny flushed line BEFORE each host phase of the frame loop
+ * (S=step, P=polls+tail, V=present), so if the process aborts
+ * mid-frame the LAST marker in the breadcrumb names the phase in
+ * progress. Frame-granularity, sim-thread only, persistent handle
+ * (the ET/EU pattern) - no in-step instrumentation (EY convicted
+ * that) and no cadence removal (EO/EP convicted the diet). */
+static FILE *s_phase_fp = NULL;
+static void rr3_phase_mark(char ph, unsigned tick) {
+    if (!s_phase_fp) s_phase_fp = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+    if (s_phase_fp) { fprintf(s_phase_fp, "ph %c tick=%u\n", ph, tick); fflush(s_phase_fp); }
 }
 
 static void display_present(void)
@@ -250,6 +605,10 @@ static void display_present(void)
         const uint32_t *src = s_fb[y];
         uint32_t *r0 = dst + (48 + y * 2) * SCR_W + 160;
         uint32_t *r1 = r0 + SCR_W;
+        /* Build FC: scalar blit restored — FB died at 0146AE with the
+         * wide blit + preswap together; FC keeps ONLY the preswap (the
+         * split A/B). FC sails -> the wide blit is convicted outright;
+         * FC dies -> the preswap is convicted. */
         for (int x = 0; x < FB_W; x++) {
             uint32_t v = src[x];
             r0[x * 2] = v; r0[x * 2 + 1] = v;
@@ -354,6 +713,13 @@ static int sim_thread(SceSize args, void *argp)
     uint64_t t1 = sceKernelGetProcessTimeWide();
     double sim_ms = (double)(t1 - t0) / 1000.0 / 600.0;
     breadcrumb("phase1-done", sim_ms);
+    /* Build FQ: apply the 2P-gate menu rename HERE - phase 1 (incl.
+     * func_000690's boot delay) is complete and phase 2 has not run a
+     * single step, so any frontend pre-render in phase 2/3 reads the
+     * renamed text. The first-poll call in the phase-3 drain remains
+     * as an idempotent backstop (verify-then-overwrite). */
+    { extern void rr3_fn_apply_text_patch(void);
+      rr3_fn_apply_text_patch(); }
 #ifdef RR3_MASK_LO
     { extern uint32_t g_mask_tried, g_mask_hit;
       FILE *mf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
@@ -401,7 +767,9 @@ static int sim_thread(SceSize args, void *argp)
     uint32_t prev_mask_skip = 0;
     uint32_t prev_mask_freeze = 0;
     s_stats_on = 1;
+    rr3_audio_start(); /* Build GR: open the audio port + feeder thread */
     for (;;) {
+        uint64_t ttop0 = sceKernelGetProcessTimeWide(); /* EV prof3: top */
         in.pad[0] = read_pad();
         /* Build CS input forensics: log every CHANGE in the Genesis
          * pad stream — the exact bits the game is about to receive —
@@ -419,16 +787,57 @@ static int sim_thread(SceSize args, void *argp)
             }
             prev_pad = in.pad[0];
         }
+        s_prof_top_us += sceKernelGetProcessTimeWide() - ttop0; /* EV */
         uint64_t ts0 = sceKernelGetProcessTimeWide();
+        s_prof_t0 = ts0; s_prof_armed = 1; s_prof_fired = 0; rr3_prof6_armed = 1;
+        rr3_phase_mark('S', (unsigned)genesis_sim_tick_count()); /* FM */
         /* Build DP: once frozen, stop stepping — keep rendering so
          * the FAIL stamp stays on screen for Lola to read. */
         { extern uint32_t g_mask_freeze;
           if (!g_mask_freeze) genesis_sim_step(&in, &s_audio, &s_hooks); }
         uint64_t ts1 = sceKernelGetProcessTimeWide();
+        if (s_prof_fired) s_prof_rest_us += ts1 - s_prof_t2;
+        s_prof_armed = 0; rr3_prof6_armed = 0;
         step_ms = step_ms * 0.9 + ((double)(ts1 - ts0) / 1000.0) * 0.1;
         s_stat_tick = (unsigned)genesis_sim_tick_count();
         s_stat_sim_ms = step_ms;
         s_stat_roll_ms = roll_ms;
+        rr3_phase_mark('P', (unsigned)genesis_sim_tick_count()); /* FM */
+        /* Build GR: hand this frame's rendered FM/PSG to the output
+         * stage - post-step, in the poll phase with the other drains.
+         * Skipped once the mask freeze halts stepping, so a frozen
+         * build goes silent instead of looping its last frame. */
+        { extern uint32_t g_mask_freeze;
+          if (!g_mask_freeze) rr3_audio_push();
+          /* Build GS: flush the one-shot audio capture (384 KB,
+           * once per boot, lands at the title screen). */
+          if (s_audcap_pending) {
+              s_audcap_pending = 0;
+              FILE *cf = fopen("ux0:/data/rr3vita/audcap.raw", "wb");
+              if (cf) { fwrite(s_audcap, sizeof(int16_t),
+                               RR3_AUDCAP_FRAMES * 2u, cf);
+                        fclose(cf); }
+              FILE *bf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (bf) { fprintf(bf, "audcap frames=%u\n",
+                                (unsigned)RR3_AUDCAP_FRAMES);
+                        fclose(bf); }
+          }
+          /* Build GT: flush the ring-exit capture (384 KB, once
+           * per boot) alongside the entry capture. */
+          if (s_audcap2_pending) {
+              s_audcap2_pending = 0;
+              FILE *cf = fopen("ux0:/data/rr3vita/audcap2.raw", "wb");
+              if (cf) { fwrite(s_audcap2, sizeof(int16_t),
+                               RR3_AUDCAP2_FRAMES * 2u, cf);
+                        fclose(cf); }
+              FILE *bf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (bf) { fprintf(bf, "audcap2 frames=%u\n",
+                                (unsigned)RR3_AUDCAP2_FRAMES);
+                        fclose(bf); }
+          } }
+        uint64_t tpoll0 = sceKernelGetProcessTimeWide(), tring0 = tpoll0;
+        static FILE *poll_fp = NULL; /* Build EU: persistent breadcrumb
+         * handle for the capsule poll (see the CT block below). */
 #ifdef RR3_MASK_LO
         /* Build CT capsule forensics: poll the mask counters from
          * this thread after each step — when a masked (killer)
@@ -438,13 +847,16 @@ static int sim_thread(SceSize args, void *argp)
          * (g_mask_last_addr), never does IO. */
         { extern uint32_t g_mask_tried, g_mask_hit, g_mask_last_addr;
           if (g_mask_tried != prev_mask_tried) {
-              FILE *cf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
-              if (cf) { fprintf(cf, "capsule tick=%u addr=%06X tried=%u hit=%u\n",
+              /* Build EU: persistent poll handle — same capsule line,
+               * same order, fflush after every write (the ET tail
+               * pattern applied to the polls region's hot writer). */
+              if (!poll_fp) poll_fp = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (poll_fp) { fprintf(poll_fp, "capsule tick=%u addr=%06X tried=%u hit=%u\n",
                                 (unsigned)genesis_sim_tick_count(),
                                 (unsigned)g_mask_last_addr,
                                 (unsigned)g_mask_tried,
                                 (unsigned)g_mask_hit);
-                        fclose(cf); }
+                        fflush(poll_fp); }
               prev_mask_tried = g_mask_tried;
           } }
         /* Build DH: poll the capsule-failure record and the native
@@ -489,14 +901,90 @@ static int sim_thread(SceSize args, void *argp)
                         fclose(sf); }
               prev_mask_skip = g_mask_skip_count;
           } }
+        /* Build DV: poll the late-set arm + run counter. DU froze
+         * at this boundary and lived, convicting the NEXT step;
+         * DV does NOT freeze — the 01A718 skip arms the late set
+         * (the nine post-1860C8 direct calls run through the
+         * capsule from here on) and the convicted step runs. A
+         * late capsule failure freezes via the DQ machinery with
+         * its record; if all nine run clean and the process still
+         * dies, the nine are exonerated as a set. */
+        { extern uint32_t g_late_armed, g_late_count, g_late_last_addr;
+          extern uint32_t g_late_released;
+          static uint32_t prev_late_armed = 0, prev_late_count = 0;
+          static uint32_t race_steps = 0;
+          if (g_late_armed && !prev_late_armed) {
+              FILE *af = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (af) { fprintf(af, "haarm tick=%u pc=%06X\n",
+                                (unsigned)genesis_sim_tick_count(),
+                                (unsigned)(g_cpu.PC & 0xFFFFFFu));
+                        fclose(af); }
+              prev_late_armed = 1;
+          }
+          if (g_late_count != prev_late_count) {
+              FILE *lf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (lf) { fprintf(lf, "latecaps tick=%u addr=%06X n=%u\n",
+                                (unsigned)genesis_sim_tick_count(),
+                                (unsigned)g_late_last_addr,
+                                (unsigned)g_late_count);
+                        fclose(lf); }
+              prev_late_count = g_late_count;
+          }
+          /* Build EN: release the late set's hot ten once racing
+           * resumes — 300 steps with the guest PC in the racing
+           * range [014000,015000) after the arm. */
+          if (g_late_armed && !g_late_released) {
+              uint32_t pc = (unsigned)(g_cpu.PC & 0xFFFFFFu);
+              if (pc >= 0x014000u && pc < 0x015000u) {
+                  if (++race_steps >= 300u) {
+                      g_late_released = 1;
+                      FILE *rf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+                      if (rf) { fprintf(rf, "enrel tick=%u pc=%06X\n",
+                                        (unsigned)genesis_sim_tick_count(),
+                                        pc);
+                                fclose(rf); }
+                  }
+              }
+          } }
+        /* Build FN: drain the 2-player gate counters (glue_fn.c). The
+         * fnmenu line prints once at the first poll (boot state: how
+         * many menu text slots were renamed); fn2p prints whenever
+         * the selector clamp fires. */
+        { extern uint32_t g_fn2p_clamps, g_fn2p_last, g_fn_text_patches;
+          static uint32_t prev_fn2p = 0;
+          static int fn_boot_logged = 0;
+          if (!fn_boot_logged) {
+              /* Build FP: apply the menu rename now - boot is complete
+               * (FN applied it during glue init and the guest hung in
+               * its boot delay; FO's bisect convicted the patch-at-init).
+               * Build FQ: main.c already applied it at the phase1-done
+               * transition; this call is the idempotent backstop, and
+               * fnmenu reports the total (6 = both name sets). */
+              { extern void rr3_fn_apply_text_patch(void);
+                rr3_fn_apply_text_patch(); }
+              FILE *bf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (bf) { fprintf(bf, "fnmenu textpatches=%u gate=on\n",
+                                (unsigned)g_fn_text_patches);
+                        fclose(bf); }
+              fn_boot_logged = 1;
+          }
+          if (g_fn2p_clamps != prev_fn2p) {
+              FILE *gf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (gf) { fprintf(gf, "fn2p tick=%u sel=%u n=%u\n",
+                                (unsigned)genesis_sim_tick_count(),
+                                (unsigned)g_fn2p_last,
+                                (unsigned)g_fn2p_clamps);
+                        fclose(gf); }
+              prev_fn2p = g_fn2p_clamps;
+          } }
         /* Build DP: poll the freeze flag — print the failure record
          * once, from this thread, now that the sim has stopped and
          * the record cannot die with the process. */
-        { extern uint32_t g_mask_freeze, g_mask_fail_addr,
+        { extern uint32_t g_mask_freeze, g_mask_fail_addr, g_mask_fail_count,
                           g_mask_fail_status, g_mask_fail_badpc,
                           g_mask_fail_badop, g_mask_fail_exit,
                           g_mask_fail_want, g_mask_fail_sp;
-          if (g_mask_freeze && !prev_mask_freeze) {
+          if (g_mask_freeze && !prev_mask_freeze && g_mask_fail_count) {
               FILE *zf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
               if (zf) { fprintf(zf, "maskfreeze tick=%u addr=%06X st=%u badpc=%06X badop=%04X exit=%06X want=%06X sp=%08X\n",
                                 (unsigned)genesis_sim_tick_count(),
@@ -510,6 +998,64 @@ static int sim_thread(SceSize args, void *argp)
                         fclose(zf); }
               prev_mask_freeze = 1;
           } }
+        { uint64_t tb = sceKernelGetProcessTimeWide();
+          s_prof_polls_us += tb - tpoll0; tring0 = tb; }
+#ifdef RR3_WATCH_BUILD
+        /* Build FI: drain the standings-watch ring (written by
+         * glue_fi.c's m68k_write hooks) and, while the late set is
+         * armed, snapshot the results records + builder inputs.
+         * All stdio happens here, between steps. */
+        { typedef struct { uint32_t cyc, pc, addr, val; uint8_t sz, kind; uint16_t pad; } RR3WatchEntShim;
+          extern RR3WatchEntShim g_watch_ring[];
+          extern volatile uint32_t g_watch_head, g_watch_drop;
+          extern uint32_t g_watch_tail;
+          if (g_watch_tail != g_watch_head) {
+              FILE *wf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (wf) {
+                  while (g_watch_tail != g_watch_head) {
+                      RR3WatchEntShim *e = &g_watch_ring[g_watch_tail & 8191u];
+                      fprintf(wf, "watch tick=%u cyc=%u pc=%06X addr=%06X sz=%u val=%08X kind=%u\n",
+                              (unsigned)genesis_sim_tick_count(),
+                              (unsigned)e->cyc, (unsigned)e->pc,
+                              (unsigned)e->addr, (unsigned)e->sz,
+                              (unsigned)e->val, (unsigned)e->kind);
+                      g_watch_tail++;
+                  }
+                  if (g_watch_drop)
+                      fprintf(wf, "watchdrop n=%u\n", (unsigned)g_watch_drop);
+                  fclose(wf);
+              }
+          }
+          { extern uint32_t g_late_armed;
+            extern uint8_t g_ram[];
+            static uint32_t snap_n = 0, snap_last = 0;
+            if (g_late_armed && snap_n < 40u &&
+                (uint32_t)frames - snap_last >= 30u) {
+                snap_last = (uint32_t)frames; snap_n++;
+                unsigned flag = ((unsigned)g_ram[0x022C] << 8) | g_ram[0x022D];
+                unsigned at = ((unsigned)g_ram[0x0A14] << 24) | ((unsigned)g_ram[0x0A15] << 16) |
+                              ((unsigned)g_ram[0x0A16] << 8) | g_ram[0x0A17];
+                unsigned bt = ((unsigned)g_ram[0x0E94] << 24) | ((unsigned)g_ram[0x0E95] << 16) |
+                              ((unsigned)g_ram[0x0E96] << 8) | g_ram[0x0E97];
+                FILE *sf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+                if (sf) {
+                    fprintf(sf, "recsnap tick=%u n=%u flag022C=%04X A t=%08X w=%04X f=%02X i=%u B t=%08X w=%04X f=%02X i=%u buf=",
+                            (unsigned)genesis_sim_tick_count(), (unsigned)snap_n, flag,
+                            at, (unsigned)(((unsigned)g_ram[0x0A18] << 8) | g_ram[0x0A19]),
+                            (unsigned)g_ram[0x0A1A], (unsigned)g_ram[0x0A26],
+                            bt, (unsigned)(((unsigned)g_ram[0x0E98] << 8) | g_ram[0x0E99]),
+                            (unsigned)g_ram[0x0E9A], (unsigned)g_ram[0x0EA6]);
+                    for (int k = 0; k < 8; k++) {
+                        unsigned o = 0x741Eu + 4u * (unsigned)k;
+                        fprintf(sf, " %08X", (unsigned)(((unsigned)g_ram[o] << 24) |
+                                ((unsigned)g_ram[o + 1] << 16) |
+                                ((unsigned)g_ram[o + 2] << 8) | g_ram[o + 3]));
+                    }
+                    fprintf(sf, "\n");
+                    fclose(sf);
+                }
+            } } }
+#endif
         /* Build CV call-ring drain: log the first sighting of every
          * guest function called this session — dispatch or direct —
          * and snapshot the ring's tail. Build DI: the snapshot now
@@ -521,6 +1067,12 @@ static int sim_thread(SceSize args, void *argp)
         { extern volatile uint32_t g_call_ring_addr[], g_call_ring_tick[],
                                    g_call_ring_head;
           static uint32_t call_drained = 0;
+          static FILE *tail_fp = NULL; /* Build ET: persistent breadcrumb
+                             * handle for the ring/tail block — opened once,
+                             * fflush'ed every frame, never fclose'd per frame.
+                             * Same lines, same order, same per-frame flush
+                             * durability as the ES open/close pattern; only
+                             * the open/close overhead is removed. */
           static uint8_t call_seen[0x200000 / 8];
           uint32_t head = g_call_ring_head;
           FILE *cf = NULL;
@@ -533,7 +1085,7 @@ static int sim_thread(SceSize args, void *argp)
               if (a >= 0x200000u) continue;
               if (call_seen[a >> 3] & (uint8_t)(1u << (a & 7u))) continue;
               call_seen[a >> 3] |= (uint8_t)(1u << (a & 7u));
-              if (!cf) cf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (!cf) { if (!tail_fp) tail_fp = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a"); cf = tail_fp; }
               if (cf) fprintf(cf, "call tick=%u addr=%06X\n",
                               (unsigned)t, (unsigned)a);
           }
@@ -541,24 +1093,40 @@ static int sim_thread(SceSize args, void *argp)
                              * (was every 30) — DP died <=20 ticks after
                              * the last snapshot; shrink the blind
                              * window to under one tick. */
-              if (!cf) cf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
-              if (cf) { fprintf(cf, "tail tick=%u pc=%06X",
-                                  (unsigned)genesis_sim_tick_count(),
-                                  (unsigned)(g_cpu.PC & 0xFFFFFFu));
+              if (!cf) { if (!tail_fp) tail_fp = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a"); cf = tail_fp; }
+              if (cf) { /* Build EW: the whole tail line is built in
+                         * a stack buffer and written with ONE fwrite
+                         * (was 34 fprintf calls: header + 32 entries +
+                         * newline). Byte-identical output, same
+                         * end-of-block fflush below. */
+                        char tbuf[384]; int tl = 0;
+                        tl += snprintf(tbuf + tl, sizeof tbuf - (size_t)tl,
+                                       "tail tick=%u pc=%06X",
+                                       (unsigned)genesis_sim_tick_count(),
+                                       (unsigned)(g_cpu.PC & 0xFFFFFFu));
                         for (uint32_t k = (head >= 32u ? head - 32u : 0u);
-                             k < head; k++)
-                            fprintf(cf, " %06X",
-                                    (unsigned)g_call_ring_addr[k & 511u]);
-                        fprintf(cf, "\n"); }
+                             k < head && tl < (int)sizeof tbuf - 10; k++)
+                            tl += snprintf(tbuf + tl, sizeof tbuf - (size_t)tl,
+                                           " %06X",
+                                           (unsigned)g_call_ring_addr[k & 511u]);
+                        if (tl < (int)sizeof tbuf - 2)
+                            tl += snprintf(tbuf + tl, sizeof tbuf - (size_t)tl, "\n");
+                        fwrite(tbuf, 1, (size_t)tl, cf); }
           }
-          if (cf) fclose(cf); }
+          if (cf) fflush(cf); }
 #endif
-        display_present();
+        s_prof_ring_us += sceKernelGetProcessTimeWide() - tring0;
+        rr3_phase_mark('V', (unsigned)genesis_sim_tick_count()); /* FM */
+        { uint64_t tp0 = sceKernelGetProcessTimeWide();
+          display_present();
+          s_prof_pres_us += sceKernelGetProcessTimeWide() - tp0; }
 
         uint64_t now = sceKernelGetProcessTimeWide();
         roll_ms = roll_ms * 0.9 + ((double)(now - last) / 1000.0) * 0.1;
+        s_prof_frame_us += now - last;
         last = now;
         frames++;
+        uint64_t tplay0 = sceKernelGetProcessTimeWide(); /* EV prof3 */
         if ((frames % 20) == 0) breadcrumb("play", roll_ms);
 #ifdef RR3_MASK_LO
         if ((frames % 1200) == 0) {
@@ -566,10 +1134,74 @@ static int sim_thread(SceSize args, void *argp)
             FILE *mf = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
             if (mf) { fprintf(mf, "maskstat phase=3 frames=%d tried=%u hit=%u\n",
                               frames, g_mask_tried, g_mask_hit); fclose(mf); }
+            { FILE *af2 = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (af2) { fprintf(af2, "audstat frames=%d fm=%u psg=%u out=%u und=%u ovr=%u\n",
+                                 frames, (unsigned)s_fm_count,
+                                 (unsigned)s_psg_count,
+                                 (unsigned)s_aud_produced,
+                                 (unsigned)s_aud_underruns,
+                                 (unsigned)s_aud_overruns);
+                         fclose(af2); } }
+            { FILE *pf2 = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+              if (pf2) { fprintf(pf2, "prof game=%.2f mach=%.2f rest=%.2f pres=%.2f n=1200\n",
+                                 (double)s_prof_game_us / 1200000.0,
+                                 (double)s_prof_mach_us / 1200000.0,
+                                 (double)s_prof_rest_us / 1200000.0,
+                                 (double)s_prof_pres_us / 1200000.0);
+                         fclose(pf2); }
+              { double stepv = (double)(s_prof_game_us + s_prof_mach_us + s_prof_rest_us) / 1200000.0;
+                double presv = (double)s_prof_pres_us / 1200000.0;
+                double pollv = (double)s_prof_polls_us / 1200000.0;
+                double ringv = (double)s_prof_ring_us / 1200000.0;
+                double framv = (double)s_prof_frame_us / 1200000.0;
+                double othv = framv - stepv - presv - pollv - ringv;
+                FILE *pf3 = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+                if (pf3) { fprintf(pf3, "prof2 step=%.2f polls=%.2f ring=%.2f pres=%.2f other=%.2f frame=%.2f n=1200\n",
+                                   stepv, pollv, ringv, presv, othv, framv);
+                           fclose(pf3); }
+                s_prof_polls_us = s_prof_ring_us = s_prof_frame_us = 0; }
+              { FILE *pf4 = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+                if (pf4) { fprintf(pf4, "prof3 wait=%.2f play=%.2f top=%.2f n=1200\n",
+                                   (double)s_prof_wait_us / 1200000.0,
+                                   (double)s_prof_play_us / 1200000.0,
+                                   (double)s_prof_top_us / 1200000.0);
+                           fclose(pf4); }
+                s_prof_wait_us = s_prof_play_us = s_prof_top_us = 0; }
+              { FILE *pf5 = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+                if (pf5) { fprintf(pf5, "prof5 run=%.2f drain=%.2f n=1200\n",
+                                   (double)s_prof_run_us / 1200000.0,
+                                   (double)s_prof_drain_us / 1200000.0);
+                           fclose(pf5); }
+                s_prof_run_us = s_prof_drain_us = 0; }
+              { FILE *pf6 = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+                if (pf6) { fprintf(pf6, "prof6 chunk=%.2f mid=%.2f rend=%.2f n=1200\n",
+                                   (double)g_prof6_chunk_us / 1200000.0,
+                                   (double)g_prof6_mid_us / 1200000.0,
+                                   (double)g_prof6_rend_us / 1200000.0);
+                           fclose(pf6); }
+                g_prof6_chunk_us = g_prof6_mid_us = g_prof6_rend_us = 0; }
+              { FILE *pf7 = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+                if (pf7) { fprintf(pf7, "prof7 scan=%.2f conv=%.2f sink=%.2f n=1200\n",
+                                   (double)g_prof7_scan_us / 1200000.0,
+                                   (double)g_prof7_conv_us / 1200000.0,
+                                   (double)g_prof7_sink_us / 1200000.0);
+                           fclose(pf7); }
+                g_prof7_scan_us = g_prof7_conv_us = g_prof7_sink_us = 0; }
+              { FILE *pf8 = fopen("ux0:/data/rr3vita/breadcrumb.txt", "a");
+                if (pf8) { fprintf(pf8, "prof8 spr=%.2f fetch=%.2f comp=%.2f n=1200\n",
+                                   (double)g_prof8_spr_us / 1200000.0,
+                                   (double)g_prof8_fetch_us / 1200000.0,
+                                   (double)g_prof8_comp_us / 1200000.0);
+                           fclose(pf8); }
+                g_prof8_spr_us = g_prof8_fetch_us = g_prof8_comp_us = 0; }
+              s_prof_game_us = s_prof_mach_us = s_prof_rest_us = s_prof_pres_us = 0; }
         }
 #endif
+        s_prof_play_us += sceKernelGetProcessTimeWide() - tplay0; /* EV */
 
-        sceDisplayWaitVblankStart();
+        { uint64_t tw0 = sceKernelGetProcessTimeWide(); /* EV prof3: wait */
+          sceDisplayWaitVblankStart();
+          s_prof_wait_us += sceKernelGetProcessTimeWide() - tw0; }
     }
     return 0;
 }

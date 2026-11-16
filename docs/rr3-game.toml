@@ -1,0 +1,46 @@
+# game.toml — Road Rash 3 (EA, 1995). USA/Europe, 2 MB ROM.
+# 68000, flat $000000-$1FFFFF, identity-mapped (no banks, NO SRAM — password game).
+#
+# First bring-up config: pure-heuristic discovery. No community disassembly
+# exists for RR3, so — like Rocket Knight Adventures, the toolchain's first
+# non-Sonic bring-up — discovery is the recompiler's vector-table scan +
+# BSR/JSR/RTS walk, seeded explicitly below, with jump-table autodiscovery on.
+# All facts from the Stage 0 Ghidra recon, 2026-10-15 (rr3-stage0-recon.md).
+#
+# ROM identity (USA/Europe): MD5 dce9b99a3d692cb4463f9f35d278659b,
+# SHA1 b2324833bf81223a9626a6060cafc203dd203468, header "ROAD RASH 3",
+# serial GM T-50966 -00, region UEJ. Vectors (from $000000):
+#   SSP   $00FFFFF6
+#   Entry $000200
+#   V-int $0021B6   (VBlank handler)
+#   H-int $0024FA   (HBlank handler)
+
+[game]
+output_prefix = "rr3"
+# No annotations / discovery files yet: pure-heuristic discovery.
+# RR3 reaches much of its code through tables (e.g. the 20-entry sound
+# dispatcher branch table at $03A4CE), so enable the pcrel16 jump-table
+# auto-walk (off by default for the Sonic games, which seed from disasm).
+jump_table_autodiscovery = true
+
+# ---------------------------------------------------------------------------
+# Per-game RAM layout. The Sonic-shaped tracking fields are UNKNOWN for RR3 —
+# left 0 (cosmetic; they only feed boot-smoke/telemetry). The LOAD-BEARING
+# stack fields use RR3's actual reset SSP $00FFFFF6 from the vector table.
+# ---------------------------------------------------------------------------
+[ram_layout]
+game_mode      = 0x000000     # unknown (cosmetic) — refine from disasm
+vint_runcount  = 0x000000     # unknown (cosmetic)
+vint_routine   = 0x000000     # unknown (cosmetic)
+plc_pending    = 0x000000     # RR3 has no Sonic PLC system
+initial_ssp    = 0x00FFFFF6   # reset SSP; LOAD-BEARING
+vbla_stack     = 0x00FFFFF6   # V-int handler stack base (starting value)
+intr_stack     = 0x00FFFFF6   # IRQ handler stack base (starting value)
+player_object  = 0x000000     # unknown (cosmetic)
+level_modes    = []
+
+# Heuristic discovery is seeded from the vector table automatically; list the
+# entry + both interrupt handlers explicitly too (both are real ROM code in
+# RR3 — unlike RKA, whose H-int lives in RAM).
+[functions]
+extra = [0x000200, 0x0021B6, 0x0024FA]

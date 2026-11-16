@@ -1,0 +1,55 @@
+# rr3-floor-leads.toml - Tier-3 floor coverage leads for Road Rash 3
+# Extracted 2026-10-15 (PDT) from Candy's VM runner build
+# (build/floor_coverage.toml, engine git f875aa8eac, 41 entries).
+# These are functions the interpreter floor executed during a 2000-frame
+# run that heuristic discovery had missed - including $03AB40, the
+# send-command function at the heart of Bug #1 (the Z80 handshake stall).
+# Reference from game.toml:
+#   [game]
+#   discovery_files = ["rr3-floor-leads.toml"]
+# Diagnosis: ../bug1-diagnosis.md (scheduler-starvation root cause)
+
+[functions]
+extra = [
+  0x03A4CE,
+  0x03B54A,
+  0x03B55E,
+  0x03AF3A,
+  0x0006F8,
+  0x0007C4,
+  0x00072A,
+  0x000752,
+  0x0007A0,
+  0x000C2A,
+  0x001492,
+  0x0014F4,
+  0x000740,
+  0x000C58,
+  0x000BE2,
+  0x000BCC,
+  0x00077E,
+  0x03A4E6,
+  0x03A4F2,
+  0x03A4EA,
+  0x03B1C8,
+  0x03ABC2,
+  0x03A4D2,
+  0x03B4CA,
+  0x03AFEC,
+  0x03B068,
+  0x0022E2,
+  0x017A6A,
+  0x03A502,
+  0x03A506,
+  0x03A4DE,
+  0x03B466,
+  0x03AB40,
+  0x03AFBE,
+  0x00318E,
+  0x017996,
+  0x002AD0,
+  0x002B42,
+  0x003AD8,
+  0x003CAC,
+  0x03A4A8
+]
